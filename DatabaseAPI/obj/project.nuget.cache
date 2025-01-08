@@ -1,0 +1,11 @@
+{
+  "version": 2,
+  "dgSpecHash": "rMS75QwNVIU=",
+  "success": true,
+  "projectFilePath": "/home/mcx/RiderProjects/DatabaseAPI/DatabaseAPI/DatabaseAPI.csproj",
+  "expectedPackageFiles": [
+    "/home/mcx/.nuget/packages/microsoft.netframework.referenceassemblies/1.0.3/microsoft.netframework.referenceassemblies.1.0.3.nupkg.sha512",
+    "/home/mcx/.nuget/packages/microsoft.netframework.referenceassemblies.net48/1.0.3/microsoft.netframework.referenceassemblies.net48.1.0.3.nupkg.sha512"
+  ],
+  "logs": []
+}

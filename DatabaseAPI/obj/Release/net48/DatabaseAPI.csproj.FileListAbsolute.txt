@@ -1,0 +1,8 @@
+/home/mcx/RiderProjects/DatabaseAPI/DatabaseAPI/bin/Release/net48/DatabaseAPI.dll
+/home/mcx/RiderProjects/DatabaseAPI/DatabaseAPI/bin/Release/net48/DatabaseAPI.pdb
+/home/mcx/RiderProjects/DatabaseAPI/DatabaseAPI/obj/Release/net48/DatabaseAPI.GeneratedMSBuildEditorConfig.editorconfig
+/home/mcx/RiderProjects/DatabaseAPI/DatabaseAPI/obj/Release/net48/DatabaseAPI.AssemblyInfoInputs.cache
+/home/mcx/RiderProjects/DatabaseAPI/DatabaseAPI/obj/Release/net48/DatabaseAPI.AssemblyInfo.cs
+/home/mcx/RiderProjects/DatabaseAPI/DatabaseAPI/obj/Release/net48/DatabaseAPI.csproj.CoreCompileInputs.cache
+/home/mcx/RiderProjects/DatabaseAPI/DatabaseAPI/obj/Release/net48/DatabaseAPI.dll
+/home/mcx/RiderProjects/DatabaseAPI/DatabaseAPI/obj/Release/net48/DatabaseAPI.pdb
