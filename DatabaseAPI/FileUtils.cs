@@ -24,10 +24,11 @@ public static class FileUtils
 
         name += postfix;
 
-        if (!extension.StartsWith("."))
+        if (!string.IsNullOrWhiteSpace(extension) && !extension.StartsWith("."))
             extension = "." + extension;
 
-        name += extension;
+        if (!string.IsNullOrWhiteSpace(extension))
+            name += extension;
 
         var copyPath = Path.Combine(directory, name);
 
