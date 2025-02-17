@@ -1,7 +1,4 @@
 using System;
-using System.IO;
-using System.Text;
-using System.Collections.Generic;
 using System.Collections.Concurrent;
 
 using DatabaseAPI.Collections;
@@ -10,139 +7,80 @@ namespace DatabaseAPI.IO;
 
 public class DatabaseTable : IDisposable
 {
-    private volatile string _name;
+    private volatile string name;
     
-    private volatile DatabaseFile _file;
-    private volatile ConcurrentDictionary<string, DatabaseCollectionData> _collections =
-        new ConcurrentDictionary<string, DatabaseCollectionData>();
+    private volatile DatabaseFile file;
+    private volatile ConcurrentDictionary<string, DatabaseCollectionData> collections = new();
 
-    public string Name => _name;
+    public string Name => name;
     
-    public DatabaseFile File => _file;
-    public DatabaseMonitor Monitor => _file.Monitor;
+    public DatabaseFile File => file;
+    public DatabaseMonitor Monitor => file.Monitor;
 
-    public IReadOnlyDictionary<string, DatabaseCollectionData> Collections => _collections;
+    public ConcurrentDictionary<string, DatabaseCollectionData> Collections => collections;
 
-    internal DatabaseTable(string name, DatabaseFile file)
+    public DatabaseTable(string name, DatabaseFile file)
     {
-        _name = name;
-        _file = file;
+        this.name = name;
+        this.file = file;
     }
 
-    public DatabaseCollection<T> GetCollection<T>(string collectionName) where T : DatabaseObject
+    public DatabaseCollection<T> GetCollection<T>(string collectionName) where T : class
     {
-        if (string.IsNullOrWhiteSpace(collectionName))
-            throw new ArgumentNullException(nameof(collectionName));
+        if (string.IsNullOrWhiteSpace(collectionName)) throw new ArgumentNullException(nameof(collectionName));
         
-        if (!_collections.TryGetValue(collectionName, out var collectionData))
+        if (!collections.TryGetValue(collectionName, out var collectionData))
         {
-            collectionData = new DatabaseCollectionData(collectionName, null, typeof(T), typeof(DatabaseCollection<>).MakeGenericType(typeof(T)));
-            collectionData.Wrapper = new DatabaseCollection<T>();
-
-            InitializeWrapper(collectionData.Wrapper, collectionData);
+            collectionData = CreateCollection(collectionName, typeof(T));
+            
+            collections.TryAdd(collectionName, collectionData);
             return (DatabaseCollection<T>)collectionData.Wrapper;
         }
-        else
-        {
-            return (DatabaseCollection<T>)collectionData.Wrapper;
-        }
-    }
-    
-    public void WriteSelf(BinaryWriter writer)
-    {
-        writer.Write(_collections.Count);
 
-        foreach (var collection in _collections)
-        {
-            // uninitialized collection
-            if (collection.Value.Type is null || collection.Value.Wrapper is null)
-                continue;
-            
-            var nameBytes = Encoding.UTF32.GetBytes(collection.Key);
-
-            writer.Write(nameBytes.Length);
-            writer.Write(nameBytes);
-
-            writer.Write(collection.Value.Type.AssemblyQualifiedName);
-
-            collection.Value.Write(collection.Value.Wrapper.WriteSelf);
-
-            writer.Write(collection.Value.Data.Length);
-            writer.Write(collection.Value.Data);
-        }
+        return (DatabaseCollection<T>)collectionData.Wrapper;
     }
 
-    public void ReadSelf(BinaryReader reader, bool isUpdate)
+    public DatabaseCollectionData GetCollectionData(string collectionName, Type objectType)
     {
-        var size = reader.ReadInt32();
-        var found = new HashSet<string>(size);
-
-        for (int i = 0; i < size; i++)
+        if (string.IsNullOrWhiteSpace(collectionName)) throw new ArgumentNullException(nameof(collectionName));
+        if (objectType is null) throw new ArgumentNullException(nameof(objectType));
+        
+        if (!collections.TryGetValue(collectionName, out var collectionData))
         {
-            var nameLen = reader.ReadInt32();
-            var nameBytes = reader.ReadBytes(nameLen);
-            var nameValue = Encoding.UTF32.GetString(nameBytes);
-
-            var typeName = reader.ReadString();
-            var type = Type.GetType(typeName, true);
-
-            var wrapperType = typeof(DatabaseCollection<>).MakeGenericType(type);
+            collectionData = CreateCollection(collectionName, objectType);
             
-            var dataLen = reader.ReadInt32();
-            var dataValue = reader.ReadBytes(dataLen);
-
-            found.Add(nameValue);
-
-            if (!_collections.TryGetValue(nameValue, out var collectionData))
-            {
-                collectionData = new DatabaseCollectionData(nameValue, dataValue, type, wrapperType);
-
-                _collections.TryAdd(nameValue, collectionData);
-            }
-
-            if (isUpdate && collectionData.Wrapper != null)
-            {
-                InitializeWrapper(collectionData.Wrapper, collectionData);
-                
-                collectionData.Wrapper.ReadSelf(reader, true);
-            }
-            else
-            {
-                collectionData.Wrapper ??= Activator.CreateInstance(wrapperType) as DatabaseCollectionBase;
-
-                InitializeWrapper(collectionData.Wrapper, collectionData);
-                
-                collectionData.Wrapper.ReadSelf(reader, false);
-            }
+            collections.TryAdd(collectionName, collectionData);
+            return collectionData;
         }
 
-        foreach (var collection in _collections)
-        {
-            if (!found.Contains(collection.Key))
-            {
-                collection.Value.Dispose();
+        return collectionData;
+    }
 
-                _collections.TryRemove(collection.Key, out _);
-            }
-        }
+    public DatabaseCollectionData CreateCollection(string collectionName, Type objectType)
+    {
+        if (string.IsNullOrWhiteSpace(collectionName)) throw new ArgumentNullException(nameof(collectionName));
+        if (objectType == null) throw new ArgumentNullException(nameof(objectType));
+        
+        if (!DatabaseFile.TryGetReaderWriter(objectType, out var readerWriter)) throw new Exception($"Missing object reader for type {objectType.FullName}");
+        if (!DatabaseFile.TryGetManipulator(objectType, out var manipulator)) throw new Exception($"Missing object manipulator for type {objectType.FullName}");
+        
+        var data = new DatabaseCollectionData(collectionName, this, objectType, typeof(DatabaseCollection<>).MakeGenericType(objectType));
 
-        found.Clear();
+        data.ReaderWriter = readerWriter;
+        data.Manipulator = manipulator;
+        
+        data.SetNotReady();
+        return data;
     }
 
     public void Dispose()
     {
-        foreach (var collection in _collections)
-            collection.Value.Dispose();
+        if (collections != null)
+        {
+            foreach (var collection in collections) collection.Value.Dispose();
 
-        _collections.Clear();
-        _collections = null;
-    }
-
-    private void InitializeWrapper(DatabaseCollectionBase wrapper, DatabaseCollectionData data)
-    {
-        wrapper.Data = data;
-        wrapper.Name = data.Name;
-        
-        wrapper.Table = this;
+            collections.Clear();
+            collections = null;
+        }
     }
 }

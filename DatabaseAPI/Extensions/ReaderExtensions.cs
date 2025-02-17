@@ -172,15 +172,4 @@ public static class ReaderExtensions
 
         return encoding.GetString(bytes);
     }
-
-    public static T ReadObject<T>(this BinaryReader reader) where T : DatabaseObject
-    {
-        if (reader is null)
-            throw new ArgumentNullException(nameof(reader));
-        
-        var instance = DatabaseCollection<T>.Constructor();
-
-        instance.Read(reader);
-        return instance;
-    }
 }

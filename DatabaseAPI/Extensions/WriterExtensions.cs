@@ -136,15 +136,4 @@ public static class WriterExtensions
         writer.Write(bytes.Length);
         writer.Write(bytes);
     }
-
-    public static void WriteObject(this BinaryWriter writer, DatabaseObject obj)
-    {
-        if (writer is null)
-            throw new ArgumentNullException(nameof(writer));
-
-        if (obj is null)
-            throw new ArgumentNullException(nameof(obj));
-
-        obj.Write(writer);
-    }
 }

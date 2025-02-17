@@ -1,6 +1,7 @@
 using System;
 using System.IO;
-using DatabaseAPI.IO.Locks;
+using System.Threading.Tasks;
+
 using DatabaseAPI.Logging;
 
 namespace DatabaseAPI;
@@ -9,14 +10,10 @@ public static class FileUtils
 {
     public static void CopyIfExists(string path, string postfix)
     {
-        if (string.IsNullOrWhiteSpace(path))
-            throw new ArgumentNullException(nameof(path));
-
-        if (string.IsNullOrWhiteSpace(postfix))
-            throw new ArgumentNullException(nameof(postfix));
+        if (string.IsNullOrWhiteSpace(path)) throw new ArgumentNullException(nameof(path));
+        if (string.IsNullOrWhiteSpace(postfix)) throw new ArgumentNullException(nameof(postfix));
         
-        if (!File.Exists(path))
-            return;
+        if (!File.Exists(path)) return;
 
         var extension = Path.GetExtension(path);
         var name = Path.GetFileNameWithoutExtension(path);
@@ -24,11 +21,8 @@ public static class FileUtils
 
         name += postfix;
 
-        if (!string.IsNullOrWhiteSpace(extension) && !extension.StartsWith("."))
-            extension = "." + extension;
-
-        if (!string.IsNullOrWhiteSpace(extension))
-            name += extension;
+        if (!string.IsNullOrWhiteSpace(extension) && !extension.StartsWith(".")) extension = "." + extension;
+        if (!string.IsNullOrWhiteSpace(extension)) name += extension;
 
         var copyPath = Path.Combine(directory, name);
 
@@ -44,8 +38,7 @@ public static class FileUtils
     
     public static bool TryCreate(string filePath)
     {
-        if (filePath is null)
-            throw new ArgumentNullException(nameof(filePath));
+        if (filePath is null) throw new ArgumentNullException(nameof(filePath));
         
         try
         {
@@ -61,13 +54,11 @@ public static class FileUtils
     
     public static bool TryDelete(string filePath)
     {
-        if (filePath is null)
-            throw new ArgumentNullException(nameof(filePath));
+        if (filePath is null) throw new ArgumentNullException(nameof(filePath));
         
         try
         {
-            if (!File.Exists(filePath))
-                return true;
+            if (!File.Exists(filePath)) return true;
             
             File.Delete(filePath);
             return true;
@@ -79,76 +70,45 @@ public static class FileUtils
         }
     }
     
-    public static bool ReadBinary(string filePath, int minFileLength, Action<BinaryReader> reader)
+    public static async Task ReadFileAsync(string filePath, Func<StreamReader, Task> reader)
     {
-        if (string.IsNullOrWhiteSpace(filePath))
-            throw new ArgumentNullException(nameof(filePath));
-        
-        if (reader is null)
-            throw new ArgumentNullException(nameof(reader));
+        if (string.IsNullOrWhiteSpace(filePath)) throw new ArgumentNullException(nameof(filePath));
+        if (reader is null) throw new ArgumentNullException(nameof(reader));
         
         if (!File.Exists(filePath))
         {
-            Log.Debug("File Utils", $"ReadBinary() :: File '{filePath}' does not exist");
-            return false;
+            Log.Debug("File Utils", $"ReadFileAsync() :: File '{filePath}' does not exist");
+            return;
         }
 
         try
         {
-            Log.Debug("File Utils", $"ReadBinary() :: Reading file '{filePath}'");
+            Log.Debug("File Utils", $"ReadFileAsync() :: Reading file '{filePath}'");
             
-            var fileData = File.ReadAllBytes(filePath);
-
-            if (minFileLength > 0 && fileData.Length < minFileLength)
-            {
-                Log.Debug("File Utils", $"ReadBinary() :: Read invalid file data (read {filePath.Length} bytes, minimum is {minFileLength} bytes)");
-                return false;
-            }
-            
-            using (var stream = new MemoryStream(fileData))
-            using (var binary = new BinaryReader(stream))
-                reader(binary);
-
-            fileData = null;
-            return true;
+            using (var stream = File.Open(filePath, FileMode.OpenOrCreate, FileAccess.Read, FileShare.Read))
+            using (var sr = new StreamReader(stream)) await reader(sr);
         }
         catch (Exception ex)
         {
-            Log.Debug("File Utils", $"ReadBinary() :: Could not read file '{filePath}' due to an exception:\n{ex}");
-            return false;
+            Log.Debug("File Utils", $"ReadFileAsync() :: Could not read file '{filePath}' due to an exception:\n{ex}");
         }
     }
     
-    public static bool WriteBinary(string filePath, Action<BinaryWriter> writer)
+    public static async Task WriteFileAsync(string filePath, Func<StreamWriter, Task> writer)
     {
-        if (string.IsNullOrWhiteSpace(filePath))
-            throw new ArgumentNullException(nameof(filePath));
-        
-        if (writer is null)
-            throw new ArgumentNullException(nameof(writer));
+        if (string.IsNullOrWhiteSpace(filePath)) throw new ArgumentNullException(nameof(filePath));
+        if (writer is null) throw new ArgumentNullException(nameof(writer));
 
         try
         {
-            Log.Debug("File Utils", $"WriteBinary() :: Writing file '{filePath}'");
+            Log.Debug("File Utils", $"WriteFileAsync() :: Writing file '{filePath}'");
             
-            using (var stream = new MemoryStream())
-            using (var binary = new BinaryWriter(stream))
-            {
-                writer(binary);
-
-                var data = stream.ToArray();
-                
-                Log.Debug("File Utils", $"WriteBinary() :: Serialized '{data.Length}' bytes");
-
-                File.WriteAllBytes(filePath, data);
-            }
-            
-            return true;
+            using (var stream = File.Open(filePath, FileMode.Truncate, FileAccess.Write, FileShare.ReadWrite))
+            using (var sw = new StreamWriter(stream)) await writer(sw);
         }
         catch (Exception ex)
         {
-            Log.Debug("File Utils", $"WriteBinary() :: Could not write file '{filePath}' due to an exception:\n{ex}");
-            return false;
+            Log.Debug("File Utils", $"WriteFileAsync() :: Could not write file '{filePath}' due to an exception:\n{ex}");
         }
     }
 }

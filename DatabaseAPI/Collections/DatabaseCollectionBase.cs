@@ -1,35 +1,17 @@
 using System;
-using System.Collections.Concurrent;
-using System.IO;
+using System.Collections.Generic;
 using DatabaseAPI.IO;
+using DatabaseAPI.IO.Interfaces;
 
 namespace DatabaseAPI.Collections;
 
-public class DatabaseCollectionBase : IDisposable
+public abstract class DatabaseCollectionBase : IDisposable
 {
     private volatile string _name;
     private volatile int _idSize = 8;
     
     private volatile DatabaseTable _table;
     private volatile DatabaseCollectionData _data;
-
-    public int IdLength
-    {
-        get
-        {
-            if (_idSize < 1)
-                _idSize = 8; // default size
-
-            return _idSize;
-        }
-        set
-        {
-            if (value < 1)
-                throw new ArgumentOutOfRangeException(nameof(value));
-
-            _idSize = value;
-        }
-    }
     
     public string Name
     {
@@ -51,14 +33,28 @@ public class DatabaseCollectionBase : IDisposable
 
     public string TableName => Table.Name;
 
+    public IObjectReaderWriter ReaderWriter => Data.ReaderWriter;
+    public IObjectManipulator Manipulator => Data.Manipulator;
+    
     public DatabaseFile File => Table.File;
     public DatabaseMonitor Monitor => Table.Monitor;
     
+    public int? GetObjectId(object obj) => Manipulator.GetObjectId(obj);
+    
     public virtual void Dispose() { }
 
-    public void SaveChanges()
-        => Monitor.Register(false);
+    public void SaveChanges() => Monitor.Register();
+
+    public abstract IEnumerator<object> EnumerateItems();
+
+    internal abstract void SetIndex(int index, object item);
+    internal abstract void RemoveIndex(int index);
+
+    internal abstract void ClearArray();
+
+    internal abstract void MakeReady();
+    internal abstract void MakeUnReady();
     
-    internal virtual void ReadSelf(BinaryReader reader, bool isUpdate) { }
-    internal virtual void WriteSelf(BinaryWriter writer) { }
+    internal abstract bool TryGetItem(int itemId, out object item);
+    internal abstract void RemoveMissing(List<int> foundIds);
 }

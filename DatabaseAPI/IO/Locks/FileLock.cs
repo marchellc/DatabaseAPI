@@ -69,10 +69,9 @@ public class FileLock : IDisposable
         Directory = new DirectoryInfo(fileDirectory);
     }
 
-    public void Trigger()
+    public async Task TriggerAsync()
     {
-        while (_isLocked)
-            continue;
+        while (_isLocked) await Task.Delay(100);
         
         _isLocked = true;
         _lastLockPath = Path.Combine(Directory.FullName, ToLockName(ProcessUtils.ProcessId, DateTime.Now.Ticks, Name, Prefix));
@@ -82,8 +81,7 @@ public class FileLock : IDisposable
 
     public void Release()
     {
-        if (!_isLocked)
-            return;
+        if (!_isLocked) return;
 
         FileUtils.TryDelete(_lastLockPath);
 
@@ -165,8 +163,7 @@ public class FileLock : IDisposable
 
     public void Dispose()
     {
-        if (!string.IsNullOrWhiteSpace(FullPath))
-            Locks.TryRemove(FullPath, out _);
+        if (!string.IsNullOrWhiteSpace(FullPath)) Locks.TryRemove(FullPath, out _);
 
         Name = null;
         FullPath = null;

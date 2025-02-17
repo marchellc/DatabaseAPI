@@ -1,123 +1,77 @@
 using System;
+using System.Collections.Concurrent;
 using System.IO;
 using System.Timers;
 using System.Diagnostics;
+using System.Threading;
 using System.Threading.Tasks;
 using DatabaseAPI.Logging;
 using Microsoft.Win32;
+using Timer = System.Timers.Timer;
 
 namespace DatabaseAPI.IO;
 
 public class DatabaseMonitor : IDisposable
 {
     private volatile string _filePath;
-    private volatile bool _fileStatus;
     
-    private volatile int _minorChanges = 0;
-    private volatile int _majorChanges = 0;
-
-    private volatile int _reqMinorChanges = 0;
-    private volatile int _reqMajorChanges = 0;
-
-    private volatile int _maxNoMinorChangeTime = -1;
-    private volatile int _maxNoMajorChangeTime = -1;
+    private volatile bool _fileStatus;
+    private volatile bool _changeStatus;
 
     private volatile Timer _timer;
     private volatile FileSystemWatcher _watcher;
 
-    private volatile Stopwatch _majorWatch;
-    private volatile Stopwatch _minorWatch;
-
     public bool IsSavingOrReading => _fileStatus;
-    
-    public int MinorChanges => _minorChanges;
-    public int MajorChanges => _majorChanges;
-
-    public int MinorChangesRequired
-    {
-        get => _reqMinorChanges;
-        set => _reqMinorChanges = value;
-    }
-
-    public int MajorChangesRequired
-    {
-        get => _reqMinorChanges;
-        set => _reqMajorChanges = value;
-    }
-
-    public int MaxNoMinorChangeTime
-    {
-        get => _maxNoMinorChangeTime;
-        set => _maxNoMinorChangeTime = value;
-    }
-
-    public int MaxNoMajorChangeTime
-    {
-        get => _maxNoMajorChangeTime;
-        set => _maxNoMajorChangeTime = value;
-    }
+    public bool IsChanged => _changeStatus;
 
     public string FilePath
     {
         get => _filePath;
-        set => _filePath = value;
+        set => _filePath = Path.GetFullPath(value);
     }
 
-    public event Action OnWrite;
-    public event Action OnRead;
+    public event Func<Task> OnWriteAsync;
+    public event Func<Task> OnReadAsync;
 
     public DatabaseMonitor(string filePath)
     {
-        if (string.IsNullOrWhiteSpace(filePath))
+        if (string.IsNullOrWhiteSpace(filePath)) 
             throw new ArgumentNullException(nameof(filePath));
-
-        _filePath = filePath;
         
-        _watcher = new FileSystemWatcher(Path.GetDirectoryName(filePath));
+        FilePath = filePath;
+    }
+
+    public void Start(int checkInterval)
+    {
+        if (checkInterval <= 0) throw new ArgumentOutOfRangeException(nameof(checkInterval));
+        
+        _watcher = new FileSystemWatcher(Path.GetDirectoryName(FilePath));
         _watcher.Changed += OnChanged;
 
         _watcher.NotifyFilter = NotifyFilters.Size | NotifyFilters.LastWrite;
         _watcher.EnableRaisingEvents = true;
-    }
-
-    public void Start()
-    {
-        _majorWatch = new Stopwatch();
-        _minorWatch = new Stopwatch();
         
-        _timer = new Timer(100);
+        _timer = new Timer(checkInterval);
         _timer.Elapsed += UpdateTimer;
         
         _timer.Start();
+        
+        Log.Debug("Database Monitor", $"Started.");
     }
 
-    public void Reset()
+    public void Register()
     {
-        _minorChanges = 0;
-        _majorChanges = 0;
-
-        _majorWatch.Restart();
-        _minorWatch.Restart();
-    }
-
-    public void Register(bool isMinor)
-    {
-        if (isMinor)
-        {
-            _minorChanges++;
-            _minorWatch.Restart();
-        }
-        else
-        {
-            _majorChanges++;
-            _majorWatch.Restart();
-        }
+        if (_changeStatus) 
+            return;
+        
+        Log.Debug("Database Monitor", $"Registering change");
+        
+        _changeStatus = true;
     }
 
     public void Dispose()
     {
-        OnWrite = null;
-        OnRead = null;
+        Log.Debug("Database Monitor", "Disposing");
 
         if (_timer != null)
         {
@@ -136,29 +90,26 @@ public class DatabaseMonitor : IDisposable
             _watcher.Dispose();
             _watcher = null;
         }
-        
-        _minorWatch?.Stop();
-        _minorWatch = null;
-
-        _majorWatch?.Stop();
-        _majorWatch = null;
 
         _fileStatus = false;
-
-        _minorChanges = 0;
-        _majorChanges = 0;
+        _changeStatus = false;
     }
 
-    private void SaveFile()
+    private async Task SaveFileAsync()
     {
-        if (OnWrite is null)
+        Log.Debug("Database Monitor", "SaveFile called");
+        
+        if (OnWriteAsync is null)
+        {
+            Log.Debug("Database Monitor", "SaveFile while OnWrite is null");
             return;
+        }
         
         _fileStatus = true;
 
         try
         {
-            OnWrite();
+            await OnWriteAsync();
         }
         catch (Exception ex)
         {
@@ -166,20 +117,27 @@ public class DatabaseMonitor : IDisposable
         }
         finally
         {
-            Task.Run(async () => await Task.Delay(1000)).ContinueWith(_ => _fileStatus = false);
+            await Task.Delay(2500);
+
+            _fileStatus = false;
         }
     }
 
-    private void ReadFile()
+    private async Task ReadFileAsync()
     {
-        if (OnRead is null)
+        Log.Debug("Database Monitor", "ReadFile called");
+        
+        if (OnReadAsync is null)
+        {
+            Log.Debug("Database Monitor", "ReadFile while OnRead is null");
             return;
+        }
         
         _fileStatus = true;
 
         try
         {
-            OnRead();
+            await OnReadAsync();
         }
         catch (Exception ex)
         {
@@ -187,35 +145,32 @@ public class DatabaseMonitor : IDisposable
         }
         finally
         {
-            Task.Run(async () => await Task.Delay(1000)).ContinueWith(_ => _fileStatus = false);
+            await Task.Delay(2500);
+
+            _fileStatus = false;
         }
     }
 
-    private void UpdateTimer(object _, ElapsedEventArgs ev)
+    private async void UpdateTimer(object _, ElapsedEventArgs ev)
     {
-        if (_fileStatus)
+        if (_fileStatus) 
             return;
-
-        if ((_majorChanges >= _reqMajorChanges || (_maxNoMajorChangeTime > 0 && _majorWatch.ElapsedMilliseconds >= _maxNoMajorChangeTime))
-            || (_minorChanges >= _reqMinorChanges || (_maxNoMinorChangeTime > 0 && _minorWatch.ElapsedMilliseconds >= _maxNoMinorChangeTime)))
+        
+        if (_changeStatus)
         {
-            Log.Debug("Database Monitor", $"Saving database file due to change count or timeout (Major={_majorChanges} / {_reqMajorChanges}, Minor={_minorChanges} / {_reqMajorChanges})");
-            
-            Reset();
-            SaveFile();
+            _changeStatus = false;
+
+            await SaveFileAsync();
         }
     }
 
-    private void OnChanged(object _, FileSystemEventArgs ev)
+    private async void OnChanged(object _, FileSystemEventArgs ev)
     {
-        if (_fileStatus)
-            return;
-
-        if (ev.FullPath != _filePath)
-            return;
+        if (_fileStatus) return;
+        if (ev.FullPath != _filePath) return;
 
         Log.Debug("Database Monitor", $"File changed");
 
-        ReadFile();
+        await ReadFileAsync();
     }
 }

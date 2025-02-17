@@ -3,571 +3,558 @@ using System.Collections;
 using System.Collections.Generic;
 using System.Collections.Concurrent;
 using System.IO;
+using System.Linq;
+using System.Threading.Tasks;
+using DatabaseAPI.IO.Interfaces;
+using DatabaseAPI.Logging;
 
 namespace DatabaseAPI.Collections;
 
 using IO;
 
-public class DatabaseCollection<T> : DatabaseCollectionBase,
-    
-    IEnumerable<T>
-
-    where T : DatabaseObject
+public class DatabaseCollection<T> : DatabaseCollectionBase, IEnumerable<T> where T : class
 {
-    private static volatile Func<T> _constructor = Activator.CreateInstance<T>;
+    private static volatile Func<T> constructor = Activator.CreateInstance<T>;
 
     public static Func<T> Constructor
     {
-        get => _constructor;
-        set => _constructor = value;
+        get => constructor;
+        set => constructor = value;
     }
-    
-    private volatile ConcurrentDictionary<string, T> _idMap = new ConcurrentDictionary<string, T>();
-    private volatile bool _isDisposed = false;
 
-    public int Size => _idMap.Count;
-
-    public bool IsDisposed => _isDisposed;
+    private volatile DatabaseCollectionItem<T>[] array;
     
-    public List<T> Find(Func<T, bool> predicate)
+    private volatile bool isDisposed = false;
+    private volatile bool isReady = false;
+
+    public int Size => Data.Size;
+    public int Multiplier => File.ArrayResizeMultiplier;
+
+    public bool IsDisposed => isDisposed;
+    public bool IsReady => isReady;
+
+    public List<T> Where(Func<T, bool> predicate)
     {
-        if (_isDisposed)
-            throw new ObjectDisposedException(typeof(DatabaseCollection<T>).FullName);
+        if (!isReady) throw new Exception("Collection cannot be accessed while not ready");
+        if (isDisposed) throw new ObjectDisposedException("Collection is disposed.");
         
-        if (predicate is null)
-            throw new ArgumentNullException(nameof(predicate));
-        
+        if (predicate is null) throw new ArgumentNullException(nameof(predicate));
+
         var list = new List<T>();
-
-        foreach (var pair in _idMap)
+        
+        for (int i = 0; i < array.Length; i++)
         {
-            if (!predicate(pair.Value)) continue;
-            list.Add(pair.Value);
+            if (!array[i].TryGetValue(out var item)) continue;
+            if (!predicate(item)) continue;
+            
+            list.Add(item);
         }
-
+        
         return list;
-    }
-    
-    public bool TryFindNonAlloc(Func<T, bool> predicate, ICollection<T> target)
-    {        
-        if (_isDisposed)
-            throw new ObjectDisposedException(typeof(DatabaseCollection<T>).FullName);
-
-        if (predicate is null)
-            throw new ArgumentNullException(nameof(predicate));
-
-        foreach (var pair in _idMap)
-        {
-            if (!predicate(pair.Value)) continue;
-            target.Add(pair.Value);
-        }
-
-        return target.Count > 0;
-    }
-
-    public bool TryFind(Func<T, bool> predicate, out List<T> items)
-    {        
-        if (_isDisposed)
-            throw new ObjectDisposedException(typeof(DatabaseCollection<T>).FullName);
-
-        if (predicate is null)
-            throw new ArgumentException(nameof(predicate));
-
-        items = new List<T>();
-
-        foreach (var pair in _idMap)
-        {
-            if (!predicate(pair.Value)) continue;
-            items.Add(pair.Value);
-        }
-
-        return items.Count > 0;
-    }
-    
-    public T Get(string id)
-    {        
-        if (_isDisposed)
-            throw new ObjectDisposedException(typeof(DatabaseCollection<T>).FullName);
-
-        if (string.IsNullOrWhiteSpace(id))
-            throw new ArgumentNullException(nameof(id));
-
-        if (!_idMap.TryGetValue(id, out var item))
-            throw new KeyNotFoundException($"No item with ID {id} was present");
-
-        return item;
     }
 
     public T Get(Func<T, bool> predicate)
     {        
-        if (_isDisposed)
-            throw new ObjectDisposedException(typeof(DatabaseCollection<T>).FullName);
-
-        if (predicate is null)
-            throw new ArgumentNullException(nameof(predicate));
-
-        foreach (var pair in _idMap)
+        if (!isReady) throw new Exception("Collection cannot be accessed while not ready");
+        if (isDisposed) throw new ObjectDisposedException("Collection is disposed.");
+        
+        if (predicate is null) throw new ArgumentNullException(nameof(predicate));
+        
+        for (int i = 0; i < array.Length; i++)
         {
-            if (!predicate(pair.Value)) continue;
-            return pair.Value;
+            if (!array[i].TryGetValue(out var heldItem)) continue;
+            if (!predicate(heldItem)) continue;
+
+            return heldItem;
         }
 
-        throw new Exception("Could not find a matching item");
-    }
-    
-    public T GetOrAdd(Func<T, bool> predicate, Func<T> constructor)
-    {        
-        if (_isDisposed)
-            throw new ObjectDisposedException(typeof(DatabaseCollection<T>).FullName);
-
-        if (predicate is null)
-            throw new ArgumentNullException(nameof(predicate));
-        
-        if (constructor is null)
-            throw new ArgumentNullException(nameof(constructor));
-        
-        if (TryGet(predicate, out var item))
-            return item;
-
-        item = constructor();
-        item.SetId(Data.GenerateObjectId(IdLength));
-
-        _idMap.TryAdd(item.Id, item);
-
-        DatabaseEvents<T>.InvokeOnItemAdded(this, item);
-
-        Monitor.Register(false);
-        return item;
+        throw new Exception("Item could not be found");
     }
 
-    public bool TryUpdateOrAdd(Func<T, bool> predicate, Action<T> update, Func<T> constructor)
+    public T GetOrAdd(Func<T, bool> predicate, out bool isNew, Action<T> newSetup = null)
     {
-        if (_isDisposed)
-            throw new ObjectDisposedException(typeof(DatabaseCollection<T>).FullName);
+        if (!isReady) throw new Exception("Collection cannot be accessed while not ready");
+        if (isDisposed) throw new ObjectDisposedException("Collection is disposed.");
+        
+        if (predicate is null) throw new ArgumentNullException(nameof(predicate));
 
-        if (predicate is null)
-            throw new ArgumentNullException(nameof(predicate));
-
-        if (update is null)
-            throw new ArgumentNullException(nameof(update));
-
-        if (constructor is null)
-            throw new ArgumentNullException(nameof(constructor));
-
-        if (TryGet(predicate, out var item))
+        isNew = false;
+        
+        for (int i = 0; i < array.Length; i++)
         {
-            update(item);
+            if (!array[i].TryGetValue(out var heldItem)) continue;
+            if (!predicate(heldItem)) continue;
 
-            DatabaseEvents<T>.InvokeOnItemUpdated(this, item);
+            return heldItem;
+        }
 
-            Monitor.Register(false);
-            return true;
+        var newItem = Constructor();
+        var newId = Data.NextObjectId;
+
+        isNew = true;
+
+        try
+        {
+            newSetup?.Invoke(newItem);
+        }
+        catch (Exception ex)
+        {
+            Log.Error("Database Collection", ex);
+        }
+        
+        CheckArray(newId + 1);
+
+        if (array[newId].HoldItem(newItem))
+        {
+            Manipulator.SetObjectId(newItem, newId);
+            Data.IncrementSize(1);
+            Monitor.Register();
         }
         else
         {
-            item = constructor();
-            item.SetId(Data.GenerateObjectId(IdLength));
-
-            _idMap.TryAdd(item.Id, item);
-
-            DatabaseEvents<T>.InvokeOnItemAdded(this, item);
-
-            Monitor.Register(false);
-            return true;
+            Data.IdQueue.Enqueue(newId);
         }
+        
+        
+        return newItem;
     }
 
-    public bool TryUpdate(Func<T, bool> predicate, Action<T> update)
+    public void UpdateOrAdd(Func<T, bool> predicate, Func<T, bool, bool> update)
     {
-        if (_isDisposed)
-            throw new ObjectDisposedException(typeof(DatabaseCollection<T>).FullName);
-
-        if (predicate is null)
-            throw new ArgumentNullException(nameof(predicate));
-
-        if (update is null)
-            throw new ArgumentNullException(nameof(update));
-
-        if (!TryGet(predicate, out var item))
-            return false;
-
-        update(item);
+        if (!isReady) throw new Exception("Collection cannot be accessed while not ready");
+        if (isDisposed) throw new ObjectDisposedException("Collection is disposed.");
         
-        DatabaseEvents<T>.InvokeOnItemUpdated(this, item);
+        if (predicate is null) throw new ArgumentNullException(nameof(predicate));
+        if (update is null) throw new ArgumentNullException(nameof(update));
 
-        Monitor.Register(false);
-        return true;
-    }
-
-    public bool TryUpdate(string id, Action<T> update)
-    {        
-        if (_isDisposed)
-            throw new ObjectDisposedException(typeof(DatabaseCollection<T>).FullName);
-
-        if (string.IsNullOrWhiteSpace(id))
-            throw new ArgumentNullException(nameof(id));
-
-        if (update is null)
-            throw new ArgumentNullException(nameof(update));
-
-        if (!_idMap.TryGetValue(id, out var item))
-            return false;
-
-        update(item);
-        
-        DatabaseEvents<T>.InvokeOnItemUpdated(this, item);
-
-        Monitor.Register(false);
-        return true;
-    }
-    
-    public bool TryGet(Func<T, bool> predicate, out T item)
-    {        
-        if (_isDisposed)
-            throw new ObjectDisposedException(typeof(DatabaseCollection<T>).FullName);
-
-        if (predicate is null)
-            throw new ArgumentNullException(nameof(predicate));
-
-        foreach (var pair in _idMap)
+        if (TryGet(predicate, out var item))
         {
-            if (!predicate(pair.Value)) continue;
-
-            item = pair.Value;
-            return true;
+            if (!update(item, true)) 
+                return;
+            
+            Monitor.Register();
+            return;
         }
+        
+        var newItem = Constructor();
+        var newId = Data.NextObjectId;
 
-        item = default;
-        return false;
-    }
-    
-    public bool TryGet(string id, out T item)
-    {        
-        if (_isDisposed)
-            throw new ObjectDisposedException(typeof(DatabaseCollection<T>).FullName);
-
-        if (string.IsNullOrWhiteSpace(id))
-            throw new ArgumentNullException(nameof(id));
-
-        return _idMap.TryGetValue(id, out item);
-    }
-    
-    public bool TryAdd(T item)
-    {        
-        if (_isDisposed)
-            throw new ObjectDisposedException(typeof(DatabaseCollection<T>).FullName);
-
-        if (item is null)
-            throw new ArgumentNullException(nameof(item));
-
-        if (!string.IsNullOrWhiteSpace(item.Id))
+        try
         {
-            if (_idMap.ContainsKey(item.Id))
+            update(newItem, false);
+        }
+        catch (Exception ex)
+        {
+            Log.Error("Database Collection", ex);
+        }
+        
+        CheckArray(newId + 1);
+
+        if (array[newId].HoldItem(newItem))
+        {
+            Manipulator.SetObjectId(newItem, newId);
+            Data.IncrementSize(1);
+        }
+        else
+        {
+            Data.IdQueue.Enqueue(newId);
+            return;
+        }
+        
+        Monitor.Register();
+    }
+
+    public void TryGetBatched(Func<T, bool> predicate, Action<T, bool> onCompleted)
+    {
+        if (!isReady) throw new Exception("Collection cannot be accessed while not ready");
+        if (isDisposed) throw new ObjectDisposedException("Collection is disposed.");
+        
+        if (predicate is null) throw new ArgumentNullException(nameof(predicate));
+        if (onCompleted is null) throw new ArgumentNullException(nameof(onCompleted));
+
+        if (File.BatchSize < 1 || Data.Size < File.BatchSize)
+        {
+            var hasFound = TryGet(predicate, out var foundItem);
+
+            onCompleted(foundItem, hasFound);
+        }
+        else
+        {
+            var batchCount = Data.Size / File.BatchSize;
+            var batchIndex = 0;
+            var batchStatus = false;
+            
+            void BatchWorker(int batchStartIndex, int batchSize)
             {
-                return false;
+                for (int i = 0; i < batchSize; i++)
+                {
+                    if (batchStatus || batchStartIndex >= array.Length) 
+                        break;
+                    
+                    if (!array[batchStartIndex++].TryGetValue(out var heldItem)) continue;
+                    if (!predicate(heldItem)) continue;
+
+                    batchStatus = true;
+                    
+                    onCompleted(heldItem, true);
+                    break;
+                }
+            }
+            
+            for (int i = 0; i < batchCount; i++)
+            {
+                Task.Run(() => { BatchWorker(batchIndex, File.BatchSize); });
+
+                if (batchStatus) 
+                    break;
+                
+                batchIndex += File.BatchSize - 1;
             }
         }
-        else
-        {
-            item.SetId(Data.GenerateObjectId(IdLength));
-        }
-
-        _idMap.TryAdd(item.Id, item);
-
-        DatabaseEvents<T>.InvokeOnItemAdded(this, item);
-
-        Monitor.Register(false);
-        return true;
     }
 
-    public bool TrySet(T item, string id)
-    {        
-        if (_isDisposed)
-            throw new ObjectDisposedException(typeof(DatabaseCollection<T>).FullName);
-
-        if (item is null)
-            throw new ArgumentNullException(nameof(item));
-
-        if (string.IsNullOrWhiteSpace(id))
-            throw new ArgumentNullException(nameof(id));
-
-        if (!string.IsNullOrWhiteSpace(item.Id))
+    public bool TryGet(Func<T, bool> predicate, out T item)
+    {
+        if (!isReady) throw new Exception("Collection cannot be accessed while not ready");
+        if (isDisposed) throw new ObjectDisposedException("Collection is disposed.");
+        if (predicate is null) throw new ArgumentNullException(nameof(predicate));
+        
+        for (int i = 0; i < array.Length; i++)
         {
-            if (_idMap.TryRemove(item.Id, out _))
-                DatabaseEvents<T>.InvokeOnItemRemoved(this, item);
-            else
-                Data.RemoveObjectId(item.Id);
-        }
-
-        item.SetId(id);
-
-        Data.OccupyId(id);
-
-        if (_idMap.TryRemove(id, out var curItem))
-        {
-            DatabaseEvents<T>.InvokeOnItemRemoved(this, curItem);
+            if (!array[i].TryGetValue(out var heldItem)) continue;
+            if (!predicate(heldItem)) continue;
             
-            curItem.SetId(string.Empty);
+            item = heldItem;
+            return true;
+        }
+        
+        item = null;
+        return false;
+    }
+
+    public bool TryGet(int itemId, out T item)
+    {
+        if (!isReady) throw new Exception("Collection cannot be accessed while not ready");
+        if (isDisposed) throw new ObjectDisposedException("Collection is disposed.");
+        if (itemId < 0) throw new ArgumentException("ItemId cannot be negative.");
+        
+        item = null;
+        
+        if (itemId >= array.Length) 
+            return false;
+
+        return array[itemId].TryGetValue(out item);
+    }
+    
+    public int TryRemoveWhere(Func<T, bool> predicate)
+    {
+        if (!isReady) throw new Exception("Collection cannot be accessed while not ready");
+        if (isDisposed) throw new ObjectDisposedException("Collection is disposed.");
+        if (predicate is null) throw new ArgumentNullException(nameof(predicate));
+        
+        var removedCount = 0;
+
+        for (int i = 0; i < array.Length; i++)
+        {
+            if (!array[i].TryGetValue(out var heldItem)) continue;
+            if (!predicate(heldItem)) continue;
+            if (!array[i].ReleaseItem()) continue;
+            if (Manipulator.RemoveObjectId(heldItem, out var id)) Data.IdQueue.Enqueue(id);
+
+            removedCount++;
         }
 
-        _idMap.TryAdd(id, item);
+        if (removedCount > 0)
+        {
+            Data.DecrementSize(removedCount);
+            Monitor.Register();
+        }
+        
+        return removedCount;
+    }
 
-        DatabaseEvents<T>.InvokeOnItemAdded(this, item);
+    public int TryRemoveRange(IEnumerable<T> items)
+    {
+        if (!isReady) throw new Exception("Collection cannot be accessed while not ready");
+        if (isDisposed) throw new ObjectDisposedException("Collection is disposed.");
+        if (items is null) throw new ArgumentNullException(nameof(items));
 
-        Monitor.Register(false);
-        return true;
+        var count = items.Count();
+        var removedCount = 0;
+        
+        if (count < 1) return 0;
+
+        foreach (var item in items)
+        {
+            var currentItemId = Manipulator.GetObjectId(item);
+            
+            if (!currentItemId.HasValue) continue;
+            if (currentItemId.Value >= array.Length) continue;
+            if (!array[currentItemId.Value].ReleaseItem()) continue;
+            if (Manipulator.RemoveObjectId(item, out var id)) Data.IdQueue.Enqueue(id);
+
+            removedCount++;
+        }
+
+        if (removedCount > 0)
+        {
+            Data.DecrementSize(removedCount);
+            Monitor.Register();
+        }
+        
+        return removedCount;
     }
 
     public bool TryRemove(T item)
-    {        
-        if (_isDisposed)
-            throw new ObjectDisposedException(typeof(DatabaseCollection<T>).FullName);
-
-        if (item is null)
-            throw new ArgumentNullException(nameof(item));
-
-        if (string.IsNullOrWhiteSpace(item.Id))
-            return false;
-
-        if (!_idMap.TryRemove(item.Id, out _))
-            return false;
-
-        DatabaseEvents<T>.InvokeOnItemRemoved(this, item);
-
-        Data.RemoveObjectId(item.Id);
-        
-        item.SetId(string.Empty);
-        
-        Monitor.Register(false);
-        return true;
-    }
-    
-    public bool TryRemove(string id)
-    {        
-        if (_isDisposed)
-            throw new ObjectDisposedException(typeof(DatabaseCollection<T>).FullName);
-
-        if (string.IsNullOrWhiteSpace(id))
-            throw new ArgumentNullException(nameof(id));
-
-        if (!_idMap.TryRemove(id, out var item))
-            return false;
-
-        DatabaseEvents<T>.InvokeOnItemRemoved(this, item);
-
-        Data.RemoveObjectId(id);
-        
-        item.SetId(string.Empty);
-
-        Monitor.Register(false);
-        return true;
-    }
-    
-    public int Remove(Func<T, bool> predicate)
-    {        
-        if (_isDisposed)
-            throw new ObjectDisposedException(typeof(DatabaseCollection<T>).FullName);
-
-        if (predicate is null)
-            throw new ArgumentNullException(nameof(predicate));
-
-        var count = 0;
-
-        foreach (var pair in _idMap)
-        {
-            if (!predicate(pair.Value)) continue;
-            if (!_idMap.TryRemove(pair.Key, out _)) continue;
-
-            DatabaseEvents<T>.InvokeOnItemRemoved(this, pair.Value);
-
-            Data.RemoveObjectId(pair.Key);
-            
-            pair.Value.SetId(string.Empty);
-            
-            count++;
-        }
-
-        if (count > 0)
-            Monitor.Register(false);
-
-        return count;
-    }
-
-    public void Clear()
-    {        
-        if (_isDisposed)
-            throw new ObjectDisposedException(typeof(DatabaseCollection<T>).FullName);
-
-        foreach (var pair in _idMap)
-        {
-            DatabaseEvents<T>.InvokeOnItemRemoved(this, pair.Value);
-
-            Data.RemoveObjectId(pair.Key);
-
-            pair.Value.SetId(string.Empty);
-        }
-        
-        _idMap.Clear();
-
-        DatabaseEvents.InvokeOnCleared(this);
-
-        Monitor.Register(true);
-    }
-
-    public int Count(Func<T, bool> predicate)
-    {        
-        if (_isDisposed)
-            throw new ObjectDisposedException(typeof(DatabaseCollection<T>).FullName);
-
-        if (predicate is null)
-            throw new ArgumentNullException(nameof(predicate));
-
-        var count = 0;
-
-        foreach (var pair in _idMap)
-        {
-            if (!predicate(pair.Value)) continue;
-            count++;
-        }
-
-        return count;
-    }
-
-    public List<T> GetItems()
-    {        
-        if (_isDisposed)
-            throw new ObjectDisposedException(typeof(DatabaseCollection<T>).FullName);
-
-        var list = new List<T>(_idMap.Count);
-
-        foreach (var pair in _idMap)
-            list.Add(pair.Value);
-
-        return list;
-    }
-
-    public bool GetItemsNonAlloc(ICollection<T> target)
-    {        
-        if (_isDisposed)
-            throw new ObjectDisposedException(typeof(DatabaseCollection<T>).FullName);
-
-        if (target is null)
-            throw new ArgumentNullException(nameof(target));
-
-        foreach (var pair in _idMap)
-            target.Add(pair.Value);
-
-        return target.Count > 0;
-    }
-
-    public void SaveChanges(Action action)
     {
-        if (action is null)
-            throw new ArgumentNullException(nameof(action));
+        if (!isReady) throw new Exception("Collection cannot be accessed while not ready");
+        if (isDisposed) throw new ObjectDisposedException("Collection is disposed.");
+        if (item is null) throw new ArgumentNullException(nameof(item));
+        
+        var currentItemId = Manipulator.GetObjectId(item);
+        if (!currentItemId.HasValue) return false;
+        
+        CheckArray(currentItemId.Value + 1);
 
-        action();
+        if (array[currentItemId.Value].ReleaseItem())
+        {
+            if (Manipulator.RemoveObjectId(item, out var id))
+                Data.IdQueue.Enqueue(id);
+            
+            Data.DecrementSize(1);
+            
+            Monitor.Register();
+            return true;
+        }
 
-        Monitor.Register(false);
+        return false;
     }
+
+    public int TryAddRange(IEnumerable<T> items)
+    {
+        if (!isReady) throw new Exception("Collection cannot be accessed while not ready");
+        if (isDisposed) throw new ObjectDisposedException("Collection is disposed.");
+        if (items is null) throw new ArgumentNullException(nameof(items));
+
+        var count = items.Count();
+        var addedCount = 0;
+        
+        if (count < 1) return 0;
+        
+        CheckArray(count);
+
+        foreach (var item in items)
+        {
+            var currentItemId = Manipulator.GetObjectId(item);
+            if (currentItemId.HasValue) continue;
+
+            var newItemId = Data.NextObjectId;
+            
+            CheckArray(newItemId + 1);
+
+            if (array[newItemId].HoldItem(item))
+                addedCount++;
+        }
+
+        if (addedCount > 0)
+        {
+            Data.IncrementSize(addedCount);
+            Monitor.Register();
+        }
+        
+        return addedCount;
+    }
+
+    public bool TryAdd(T item)
+    {
+        if (!isReady) throw new Exception("Collection cannot be accessed while not ready");
+        if (isDisposed) throw new ObjectDisposedException("Collection is disposed.");
+        if (item is null) throw new ArgumentNullException(nameof(item));
+
+        var currentItemId = Manipulator.GetObjectId(item);
+        if (currentItemId.HasValue) return false;
+
+        var newItemId = Data.NextObjectId;
+
+        Manipulator.SetObjectId(item, newItemId);
+
+        CheckArray(newItemId + 1);
+
+        if (array[newItemId].HoldItem(item))
+        {
+            Data.IncrementSize(1);
+            
+            Monitor.Register();
+            return true;
+        }
+
+        return false;
+    }
+
+    #region IEnumerable implementation
+    IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
     
     public IEnumerator<T> GetEnumerator()
-    {        
-        if (_isDisposed)
-            throw new ObjectDisposedException(typeof(DatabaseCollection<T>).FullName);
+    {
+        if (!isReady) throw new Exception("Collection cannot be accessed while not ready");
+        if (isDisposed) throw new ObjectDisposedException("Collection is disposed.");
+        
+        for (int i = 0; i < array.Length; i++)
+        {
+            var item = array[i];
 
-        foreach (var pair in _idMap)
-            yield return pair.Value;
+            if (!item.TryGetValue(out var value)) 
+                continue;
+
+            yield return value;
+        }
+    }
+    
+    public IEnumerator<T> EnumerateWhere(Func<T, bool> predicate)
+    {
+        if (!isReady) throw new Exception("Collection cannot be accessed while not ready");
+        if (isDisposed) throw new ObjectDisposedException("Collection is disposed.");
+        
+        if (predicate is null) throw new ArgumentNullException(nameof(predicate));
+
+        for (int i = 0; i < array.Length; i++)
+        {
+            if (!array[i].TryGetValue(out var item)) continue;
+            if (!predicate(item)) continue;
+            
+            yield return item;
+        }
     }
 
-    IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
+    public override IEnumerator<object> EnumerateItems()
+    {
+        if (!isReady) throw new Exception("Collection cannot be accessed while not ready");
+        if (isDisposed) throw new ObjectDisposedException("Collection is disposed.");
+        
+        for (int i = 0; i < array.Length; i++)
+        {
+            if (!array[i].TryGetValue(out var item))
+                continue;
+            
+            yield return item;
+        }
+    }
+    #endregion
 
-    public override void Dispose()
-    {        
-        if (_isDisposed)
-            throw new ObjectDisposedException(typeof(DatabaseCollection<T>).FullName);
-
-        base.Dispose();
-
-        _idMap?.Clear();
-        _idMap = null;
-
-        _isDisposed = true;
-
-        DatabaseEvents.InvokeOnDisposed(this);
+    private void CheckArray(int count)
+    {
+        if (array is null) InitializeArray(count < 1 ? null : count);
+        if (array.Length < count) ResizeArray(count < 1 ? null : count);
     }
 
-    internal override void ReadSelf(BinaryReader reader, bool isUpdate)
-    {        
-        if (_isDisposed)
-            throw new ObjectDisposedException(typeof(DatabaseCollection<T>).FullName);
+    private void InitializeArray(int? requiredSize)
+    {
+        if (array is null)
+        {
+            var size = File.ArrayInitialSize;
+            
+            if (requiredSize.HasValue && requiredSize.Value > size)
+                size += requiredSize.Value;
+            
+            array = new DatabaseCollectionItem<T>[size];
+            
+            for (int i = 0; i < File.ArrayInitialSize; i++)
+                array[i] = new DatabaseCollectionItem<T>();
+        }
+    }
+    
+    private void ResizeArray(int? requiredSize)
+    {
+        var size = array.Length * File.ArrayResizeMultiplier;
+            
+        if (requiredSize.HasValue && requiredSize.Value > size)
+            size += requiredSize.Value;
+        
+        var newArray = new DatabaseCollectionItem<T>[size];
+        var oldArray = array;
 
-        base.ReadSelf(reader, isUpdate);
-
-        var size = reader.ReadInt32();
-        var found = new HashSet<string>();
-
-        if (!isUpdate)
-            _idMap.Clear();
+        array = newArray;
 
         for (int i = 0; i < size; i++)
         {
-            var instanceId = reader.ReadString();
-
-            found.Add(instanceId);
-            
-            if (isUpdate && _idMap.TryGetValue(instanceId, out var existingItem))
+            if (i < oldArray.Length)
             {
-                existingItem.Read(reader);
-
-                DatabaseEvents<T>.InvokeOnItemUpdated(this, existingItem);
+                newArray[i] = oldArray[i];
+                oldArray[i] = null;
             }
             else
             {
-                existingItem = Constructor();
-                existingItem.SetId(instanceId);
-
-                Data.OccupyId(instanceId);
-
-                _idMap.TryAdd(instanceId, existingItem);
+                newArray[i] = new DatabaseCollectionItem<T>();
             }
         }
+    }
 
-        var anyMissing = false;
+    internal override void ClearArray()
+    {
+        if (isDisposed) throw new ObjectDisposedException("Collection is disposed.");
         
-        foreach (var pair in _idMap)
-        {
-            if (!found.Contains(pair.Key) && _idMap.TryRemove(pair.Key, out _))
-            {
-                DatabaseEvents<T>.InvokeOnItemRemoved(this, pair.Value);
-                
-                Data.RemoveObjectId(pair.Key);
+        if (array is null) 
+            return;
+        
+        for (int i = 0; i < array.Length; i++)
+            array[i].ReleaseItem();
+    }
+    
+    internal override void SetIndex(int index, object item)
+    {
+        if (isReady) throw new Exception("Collection is in ready mode.");
+        if (isDisposed) throw new ObjectDisposedException("Collection is disposed.");
+        
+        CheckArray(index + 1);
 
-                pair.Value.SetId(string.Empty);
-
-                anyMissing = true;
-            }
-        }
-
-        found.Clear();
-
-        if (anyMissing)
-            Monitor.Register(false);
+        array[index].HoldItem((T)item);
     }
 
-    internal override void WriteSelf(BinaryWriter writer)
-    {        
-        if (_isDisposed)
-            throw new ObjectDisposedException(typeof(DatabaseCollection<T>).FullName);
+    internal override void RemoveIndex(int index)
+    {
+        if (isReady) throw new Exception("Collection is in ready mode.");
+        if (isDisposed) throw new ObjectDisposedException("Collection is disposed.");
+        
+        CheckArray(index + 1);
+        
+        if (array[index].ReleaseItem())
+            Data.DecrementSize(1);
+    }
+    
+    internal override bool TryGetItem(int itemId, out object item)
+    {
+        if (!isReady) throw new Exception("Collection cannot be accessed while not ready");
+        if (isDisposed) throw new ObjectDisposedException("Collection is disposed.");
 
-        base.WriteSelf(writer);
+        item = null;
+        
+        if (itemId < 0 || itemId >= array.Length || !array[itemId].TryGetValue(out var heldItem)) 
+            return false;
 
-        writer.Write(_idMap.Count);
+        item = heldItem;
+        return true;
+    }
 
-        foreach (var pair in _idMap)
+    internal override void RemoveMissing(List<int> foundIds)
+    {
+        if (isDisposed) throw new ObjectDisposedException("Collection is disposed.");
+        if (array is null) return;
+        
+        for (int i = 0; i < array.Length; i++)
         {
-            writer.Write(pair.Key);
-
-            pair.Value.Write(writer);
+            if (!array[i].TryGetValue(out var item)) continue;
+            
+            var id = Manipulator.GetObjectId(item);
+            
+            if (!id.HasValue) continue;
+            if (!foundIds.Contains(id.Value)) continue;
+            
+            Manipulator.RemoveObjectId(item, out _);
+            
+            array[i].ReleaseItem();
         }
     }
+
+    internal override void MakeReady() => isReady = true;
+    internal override void MakeUnReady() => isReady = false;
 }

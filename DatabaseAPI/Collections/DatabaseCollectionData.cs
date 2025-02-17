@@ -2,122 +2,114 @@ using System;
 using System.IO;
 using System.Linq;
 using System.Collections.Concurrent;
-
+using System.Threading;
 using DatabaseAPI.Extensions;
+using DatabaseAPI.IO;
+using DatabaseAPI.IO.Interfaces;
 
 namespace DatabaseAPI.Collections;
 
 public class DatabaseCollectionData : IDisposable
 {
-    private const string _randomChars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    private static volatile Random _random = new Random();
+    private volatile string name;
     
-    private volatile byte[] _data;
-    private volatile string _name;
+    private volatile int id;
+    private volatile int size;
 
-    private volatile Type _type;
-    private volatile Type _wrapperType;
+    private volatile IObjectReaderWriter readerWriter;
+    private volatile IObjectManipulator manipulator;
 
-    private volatile DatabaseCollectionBase _wrapper;
-    private volatile ConcurrentStack<string> _occupiedIds;
+    private volatile Type type;
+    private volatile Type wrapperType;
 
-    public byte[] Data => _data;
+    private volatile DatabaseTable table;
+    private volatile DatabaseCollectionBase wrapper;
     
-    public string Name => _name;
+    private volatile ConcurrentQueue<int> idQueue = new();
+    
+    public string Name => name;
 
-    public Type Type => _type;
-    public Type WrapperType => _wrapperType;
+    public Type Type => type;
+    public Type WrapperType => wrapperType;
 
-    public DatabaseCollectionBase Wrapper
+    public IObjectReaderWriter ReaderWriter
     {
-        get => _wrapper;
-        internal set => _wrapper = value;
+        get => readerWriter;
+        set => readerWriter = value;
     }
 
-    internal DatabaseCollectionData(string name, byte[] data, Type type, Type wrapperType)
+    public IObjectManipulator Manipulator
     {
-        _data = data;
-        _name = name;
-        _type = type;
-        _wrapperType = wrapperType;
-
-        _occupiedIds = new ConcurrentStack<string>();
+        get => manipulator;
+        set => manipulator = value;
     }
 
-    public void Read(Func<BinaryReader, DatabaseCollectionBase> reader)
+    public int Size
     {
-        using (var stream = new MemoryStream(_data))
-        using (var binary = new BinaryReader(stream))
+        get => size;
+        set => size = value;
+    }
+
+    public int IdClock
+    {
+        get => id;
+        set => id = value;
+    }
+
+    public int NextObjectId
+    {
+        get
         {
-            _wrapper = reader(binary);
+            if (idQueue.TryDequeue(out var nextId)) 
+                return nextId;
+            
+            return Interlocked.Increment(ref id);
         }
     }
 
-    public void Write(Action<BinaryWriter> writer)
-    {
-        using (var stream = new MemoryStream())
-        using (var binary = new BinaryWriter(stream))
-        {
-            writer(binary);
+    public DatabaseCollectionBase Wrapper => wrapper;
+    public DatabaseTable Table => table;
+    
+    public ConcurrentQueue<int> IdQueue => idQueue;
 
-            _data = stream.ToArray();
-        }
+    public DatabaseCollectionData(string name, DatabaseTable table, Type type, Type wrapperType)
+    {
+        if (string.IsNullOrEmpty(name)) throw new ArgumentNullException(nameof(name));
+        
+        if (type is null) throw new ArgumentNullException(nameof(type));
+        if (table is null) throw new ArgumentNullException(nameof(table));
+        if (wrapperType is null) throw new ArgumentNullException(nameof(wrapperType));
+        
+        this.name = name;
+        this.type = type;
+        this.table = table;
+        
+        this.wrapperType = wrapperType;
+        this.wrapper = Activator.CreateInstance(wrapperType) as DatabaseCollectionBase;
+
+        wrapper.Data = this;
+        wrapper.Name = name;
     }
+    
+    public void IncrementSize(int amount) => Interlocked.Add(ref size, amount);
+    public void DecrementSize(int amount) => Interlocked.Exchange(ref size, size - amount);
+
+    public void SetReady() => Wrapper.MakeReady();
+    public void SetNotReady() => Wrapper.MakeUnReady();
 
     public void Dispose()
     {
-        _data = null;
-        _name = null;
+        name = null;
 
-        _wrapper?.Dispose();
-        _wrapper = null;
-    }
-    
-    public string GenerateObjectId(int idSize)
-    {
-        if (idSize < 1)
-            throw new ArgumentOutOfRangeException(nameof(idSize));
+        wrapper?.Dispose();
+        wrapper = null;
 
-        string Generate()
+        if (idQueue != null)
         {
-            var str = string.Empty;
-
-            for (int i = 0; i < idSize; i++)
-            {
-                var generated = _randomChars[_random.Next(0, _randomChars.Length)];
-
-                if (!char.IsNumber(generated) && _random.Next(0, 1) == 1)
-                    generated = char.ToLower(generated);
-
-                str += generated;
-            }
-
-            return str;
+            while (idQueue.TryDequeue(out _)) 
+                continue;
+            
+            idQueue = null;
         }
-
-        var generated = Generate();
-
-        while (_occupiedIds.Contains(generated))
-            generated = Generate();
-        
-        return generated;
-    }
-
-    public void RemoveObjectId(string objectId)
-    {
-        if (string.IsNullOrWhiteSpace(objectId))
-            throw new ArgumentNullException(nameof(objectId));
-
-        if (_occupiedIds.Contains(objectId))
-            _occupiedIds.Remove(objectId);
-    }
-
-    public void OccupyId(string objectId)
-    {
-        if (string.IsNullOrWhiteSpace(objectId))
-            throw new ArgumentNullException(nameof(objectId));
-
-        if (!_occupiedIds.Contains(objectId))
-            _occupiedIds.Push(objectId);
     }
 }

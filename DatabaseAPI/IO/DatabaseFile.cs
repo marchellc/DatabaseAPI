@@ -1,320 +1,439 @@
 using System;
 using System.IO;
-using System.Text;
+using System.Reflection;
+using System.Threading.Tasks;
 using System.Collections.Concurrent;
 
+using DatabaseAPI.IO.Interfaces;
 using DatabaseAPI.IO.Locks;
+
+using DatabaseAPI.IO.Serialization.Simple;
+using DatabaseAPI.IO.Serialization.Text;
+
+using DatabaseAPI.Logging;
 
 namespace DatabaseAPI.IO;
 
 public class DatabaseFile : IDisposable
 {
-    private static volatile ConcurrentDictionary<string, DatabaseFile> _files = new ConcurrentDictionary<string, DatabaseFile>();
-
-    public static DatabaseFile GetOrCreate(string filePath, string lockName, string lockDirectory, string lockPrefix = null, Action<DatabaseFile> onCreated = null)
+    static DatabaseFile()
     {
-        if (string.IsNullOrWhiteSpace(filePath))
-            throw new ArgumentNullException(nameof(filePath));
-
-        if (string.IsNullOrWhiteSpace(lockName))
-            throw new ArgumentNullException(nameof(lockName));
-
-        if (string.IsNullOrWhiteSpace(lockDirectory))
-            throw new ArgumentNullException(nameof(lockDirectory));
+        TryCollectReadersAndWriters(typeof(DatabaseFile).Assembly);
+    }
+    
+    private static volatile ConcurrentDictionary<string, DatabaseFile> _files = new();
+    
+    private static volatile ConcurrentDictionary<Type, IObjectReaderWriter> readersWriters = new();
+    private static volatile ConcurrentDictionary<Type, IObjectManipulator> manipulators = new();
+    
+    private static volatile ConcurrentDictionary<Type, IStreamDeserializer> deserializers = new();
+    private static volatile ConcurrentDictionary<Type, IStreamSerializer> serializers = new();
+    
+    public static DatabaseFile GetOrCreate(string filePath, string lockName, string lockDirectory, string lockPrefix = null, 
+        Action<DatabaseFile> onCreated = null, Action<DatabaseFile> onInitialized = null)
+    {
+        if (string.IsNullOrWhiteSpace(filePath)) throw new ArgumentNullException(nameof(filePath));
+        if (string.IsNullOrWhiteSpace(lockName)) throw new ArgumentNullException(nameof(lockName));
+        if (string.IsNullOrWhiteSpace(lockDirectory)) throw new ArgumentNullException(nameof(lockDirectory));
 
         filePath = Path.GetFullPath(filePath);
         lockDirectory = Path.GetFullPath(lockDirectory);
 
-        if (_files.TryGetValue(filePath, out var dbFile))
-            return dbFile;
+        if (_files.TryGetValue(filePath, out var dbFile)) return dbFile;
 
         dbFile = new DatabaseFile(filePath, lockName, lockDirectory, lockPrefix);
-        dbFile.Initialize();
-
+        
         onCreated?.Invoke(dbFile);
+        
+        dbFile.Initialize();
+        
+        onInitialized?.Invoke(dbFile);
 
         _files.TryAdd(filePath, dbFile);
         return dbFile;
     }
-
-    private volatile int _lockWaitMs = -1;
-
-    private volatile bool _lockIgnoreThis;
-    private volatile bool _lockMatchPrefix;
-    private volatile bool _lockKillOverTime;
-    private volatile bool _lockDeleteOverTime;
-    private volatile bool _lockAllowSelfKill;
-
-    private volatile bool _read;
     
-    private volatile string _path;
+    public static bool TryGetReaderWriter(Type type, out IObjectReaderWriter readerWriter) => readersWriters.TryGetValue(type, out readerWriter);
+    public static bool TryGetManipulator(Type type, out IObjectManipulator manipulator) => manipulators.TryGetValue(type, out manipulator);
     
-    private volatile string _lockName;
-    private volatile string _lockPrefix;
-    private volatile string _lockDirectory;
+    public static bool TryGetSerializer(Type type, out IStreamSerializer serializer) => serializers.TryGetValue(type, out serializer);
+    public static bool TryGetDeserializer(Type type, out IStreamDeserializer deserializer) => deserializers.TryGetValue(type, out deserializer);
 
-    private volatile DatabaseMonitor _monitor;
-    private volatile StatusLock _threadLock;
-    private volatile FileLock _fileLock;
+    public static bool TryRegisterReaderWriter(Type type, IObjectReaderWriter readerWriter)
+    {
+        if (type is null) throw new ArgumentNullException(nameof(type));
+        if (readerWriter is null) throw new ArgumentNullException(nameof(readerWriter));
+        
+        return readersWriters.TryAdd(type, readerWriter);
+    }
 
-    private volatile ConcurrentDictionary<string, DatabaseTable> _tables = new ConcurrentDictionary<string, DatabaseTable>();
+    public static bool TryRegisterManipulator(Type type, IObjectManipulator manipulator)
+    {
+        if (type is null) throw new ArgumentNullException(nameof(type));
+        if (manipulator is null) throw new ArgumentNullException(nameof(manipulator));
+        
+        return manipulators.TryAdd(type, manipulator);
+    }
 
-    public string FilePath => _path;
+    public static bool TryRegisterSerializer(IStreamSerializer serializer)
+    {
+        if (serializer is null) 
+            throw new ArgumentNullException(nameof(serializer));
+        
+        return serializers.TryAdd(serializer.GetType(), serializer);
+    }
+
+    public static bool TryRegisterDeserializer(IStreamDeserializer deserializer)
+    {
+        if (deserializer is null)
+            throw new ArgumentNullException(nameof(deserializer));
+        
+        return deserializers.TryAdd(deserializer.GetType(), deserializer);
+    }
+
+    public static int TryCollectReadersAndWriters(Assembly assembly)
+    {
+        if (assembly is null) throw new ArgumentNullException(nameof(assembly));
+
+        var count = 0;
+
+        foreach (var type in assembly.GetTypes())
+        {
+            if (type.IsGenericParameter || type.IsGenericType || type.IsGenericTypeDefinition ||
+                type.IsConstructedGenericType) 
+                continue;
+            
+            if (typeof(IObjectReaderWriter).IsAssignableFrom(type))
+            {
+                if (Activator.CreateInstance(type) is not IObjectReaderWriter readerWriter) continue;
+                if (readerWriter.Type is null) continue;
+                if (TryRegisterReaderWriter(readerWriter.Type, readerWriter)) count++;
+            }
+            else if (typeof(IObjectManipulator).IsAssignableFrom(type))
+            {
+                if (Activator.CreateInstance(type) is not IObjectManipulator manipulator) continue;
+                if (manipulator.Type is null) continue;
+                if (TryRegisterManipulator(manipulator.Type, manipulator)) count++;
+            }
+            else if (typeof(IStreamSerializer).IsAssignableFrom(type))
+            {
+                if (Activator.CreateInstance(type) is not IStreamSerializer serializer) continue;
+                if (TryRegisterSerializer(serializer)) count++;
+            }
+            else if (typeof(IStreamDeserializer).IsAssignableFrom(type))
+            {
+                if (Activator.CreateInstance(type) is not IStreamDeserializer deserializer) continue;
+                if (TryRegisterDeserializer(deserializer)) count++;
+            }
+        }
+
+        return count;
+    }
+
+    private volatile int lockWaitMs = -1;
+    private volatile int monitorIntervalMs = 10000;
     
-    public string LockName => _lockName;
-    public string LockPrefix => _lockPrefix;
-    public string LockDirectory => _lockDirectory;
+    private volatile int arrayResizeFactor = 2;
+    private volatile int arrayInitialSize = 64;
+
+    private volatile int batchSize = 1000;
+
+    private volatile bool lockIgnoreThis;
+    private volatile bool lockMatchPrefix;
+    private volatile bool lockKillOverTime;
+    private volatile bool lockDeleteOverTime;
+    private volatile bool lockAllowSelfKill;
+    private volatile bool lockEnabled;
+
+    private volatile bool read;
+    
+    private volatile string path;
+    
+    private volatile string lockName;
+    private volatile string lockPrefix;
+    private volatile string lockDirectory;
+    
+    private volatile IStreamDeserializer deserializer = TextStreamDeserializer.Instance;
+    private volatile IStreamSerializer serializer = TextStreamSerializer.Instance;
+
+    private volatile IFileReaderWriter fileReaderWriter = SimpleFileReaderWriter.Instance;
+    private volatile ITableReaderWriter tableReaderWriter = SimpleTableReaderWriter.Instance;
+    private volatile ICollectionReaderWriter collectionReaderWriter = SimpleCollectionReaderWriter.Instance;
+    
+    private volatile DatabaseMonitor monitor;
+    private volatile StatusLock threadLock;
+    private volatile FileLock fileLock;
+
+    private volatile ConcurrentDictionary<string, DatabaseTable> tables = new ConcurrentDictionary<string, DatabaseTable>();
+
+    public string FilePath => path;
+    
+    public string LockName => lockName;
+    public string LockPrefix => lockPrefix;
+    public string LockDirectory => lockDirectory;
     
     public TimeSpan MaxLockTime { get; set; } = TimeSpan.Zero;
 
+    public int BatchSize
+    {
+        get => batchSize;
+        set => batchSize = value;
+    }
+
+    public int ArrayInitialSize
+    {
+        get => arrayInitialSize;
+        set
+        {
+            if (value < 1) 
+                throw new ArgumentOutOfRangeException(nameof(value));
+            
+            arrayInitialSize = value;
+        }
+    }
+
+    public int ArrayResizeMultiplier
+    {
+        get => arrayResizeFactor;
+        set
+        {
+            if (value < 1) 
+                throw new ArgumentOutOfRangeException(nameof(value));
+            
+            arrayResizeFactor = value;
+        }
+    }
+    
+    public int MonitorCheckInterval
+    {
+        get => monitorIntervalMs;
+        set => monitorIntervalMs = value;
+    }
+    
     public int LockWaitTime
     {
-        get => _lockWaitMs;
-        set => _lockWaitMs = value;
+        get => lockWaitMs;
+        set => lockWaitMs = value;
     }
 
     public bool LockIgnoreThisProcess
     {
-        get => _lockIgnoreThis;
-        set => _lockIgnoreThis = value;
+        get => lockIgnoreThis;
+        set => lockIgnoreThis = value;
     }
 
     public bool LockMatchCustomPrefix
     {
-        get => _lockMatchPrefix;
-        set => _lockMatchPrefix = value;
+        get => lockMatchPrefix;
+        set => lockMatchPrefix = value;
     }
 
     public bool LockKillOverTime
     {
-        get => _lockKillOverTime;
-        set => _lockKillOverTime = value;
+        get => lockKillOverTime;
+        set => lockKillOverTime = value;
     }
 
     public bool LockDeleteOverTime
     {
-        get => _lockDeleteOverTime;
-        set => _lockDeleteOverTime = value;
+        get => lockDeleteOverTime;
+        set => lockDeleteOverTime = value;
     }
 
     public bool LockAllowSelfProcessKill
     {
-        get => _lockAllowSelfKill;
-        set => _lockAllowSelfKill = value;
+        get => lockAllowSelfKill;
+        set => lockAllowSelfKill = value;
+    }
+
+    public bool LockEnabled
+    {
+        get => lockEnabled;
+        set => lockEnabled = value;
+    }
+
+    public IStreamDeserializer Deserializer
+    {
+        get => deserializer;
+        set => deserializer = value;
+    }
+
+    public IStreamSerializer Serializer
+    {
+        get => serializer;
+        set => serializer = value;
     }
     
-    public bool IsInitialized => _threadLock != null && _fileLock != null;
-    public bool IsRead => _read;
+    public IFileReaderWriter FileReaderWriter
+    {
+        get => fileReaderWriter;
+        set => fileReaderWriter = value;
+    }
 
-    public DatabaseMonitor Monitor => _monitor;
+    public ITableReaderWriter TableReaderWriter
+    {
+        get => tableReaderWriter;
+        set => tableReaderWriter = value;
+    }
+
+    public ICollectionReaderWriter CollectionReaderWriter
+    {
+        get => collectionReaderWriter;
+        set => collectionReaderWriter = value;
+    }
+
+    public bool IsInitialized => threadLock != null && fileLock != null;
+    public bool IsRead => read;
+
+    public DatabaseMonitor Monitor => monitor;
+    public ConcurrentDictionary<string, DatabaseTable> Tables => tables;
     
     private DatabaseFile(string filePath, string lockName, string lockDirectory, string lockPrefix = null)
     {
-        _path = filePath;
+        path = filePath;
         
-        _lockName = lockName;
-        _lockPrefix = lockPrefix;
-        _lockDirectory = lockDirectory;
+        this.lockName = lockName;
+        this.lockPrefix = lockPrefix;
+        this.lockDirectory = lockDirectory;
     }
 
     public void Initialize()
     {
-        if (_threadLock != null && _fileLock != null && _monitor != null)
+        if (threadLock != null && fileLock != null && monitor != null)
+        {
+            Log.Debug("Database File", "This file is already initialized.");
             return;
+        }
         
-        if (string.IsNullOrWhiteSpace(FilePath))
-            throw new ArgumentNullException(nameof(FilePath));
+        if (string.IsNullOrWhiteSpace(FilePath)) throw new ArgumentNullException(nameof(FilePath));
+        if (string.IsNullOrWhiteSpace(LockName)) throw new ArgumentNullException(nameof(LockName));
+        if (string.IsNullOrWhiteSpace(LockDirectory)) throw new ArgumentNullException(nameof(LockDirectory));
 
-        if (string.IsNullOrWhiteSpace(LockName))
-            throw new ArgumentNullException(nameof(LockName));
-        
-        if (string.IsNullOrWhiteSpace(LockDirectory))
-            throw new ArgumentNullException(nameof(LockDirectory));
-        
-        _threadLock = new StatusLock();
-        
-        _monitor = new DatabaseMonitor(_path);
+        try
+        {
+            threadLock = new StatusLock();
 
-        _monitor.OnRead += Read;
-        _monitor.OnWrite += Write;
-        
-        _monitor.Start();
+            if (!Directory.Exists(LockDirectory)) Directory.CreateDirectory(LockDirectory);
 
-        if (!Directory.Exists(LockDirectory))
-            Directory.CreateDirectory(LockDirectory);
-        
-        _fileLock = FileLock.GetOrCreate(LockName, LockDirectory, LockPrefix);
+            fileLock = FileLock.GetOrCreate(LockName, LockDirectory, LockPrefix);
 
-        if (!_files.ContainsKey(_path))
-            _files.TryAdd(_path, this);
+            monitor = new DatabaseMonitor(path);
+
+            monitor.OnReadAsync += ReadAsync;
+            monitor.OnWriteAsync += WriteAsync;
+
+            monitor.Start(monitorIntervalMs);
+
+            if (!_files.ContainsKey(path)) _files.TryAdd(path, this);
+        }
+        catch (Exception ex)
+        {
+            Log.Error("Database File", $"Exception during initialization:\n{ex}");
+        }
     }
 
     public void Dispose()
     {
-        _files.TryRemove(_path, out _);
+        _files.TryRemove(path, out _);
 
-        foreach (var table in _tables)
-            table.Value.Dispose();
+        foreach (var table in tables) table.Value.Dispose();
 
-        _tables.Clear();
-        _tables = null;
+        tables.Clear(); 
+        tables = null;
 
-        if (_monitor != null)
+        if (monitor != null)
         {
-            _monitor.OnRead -= Read;
-            _monitor.OnWrite -= Write;
+            monitor.OnReadAsync -= ReadAsync;
+            monitor.OnWriteAsync -= WriteAsync;
             
-            _monitor.Dispose();
-            _monitor = null;
+            monitor.Dispose();
+            monitor = null;
         }
         
-        if (_fileLock != null)
+        if (fileLock != null)
         {
-            if (_fileLock.IsLocked)
-                _fileLock.Release();
+            if (fileLock.IsLocked) fileLock.Release();
 
-            _fileLock.Dispose();
-            _fileLock = null;
+            fileLock.Dispose();
+            fileLock = null;
         }
 
-        if (_threadLock != null)
+        if (threadLock != null)
         {
-            if (_threadLock.IsLocked)
-                _threadLock.Release();
+            if (threadLock.IsLocked) threadLock.Release();
 
-            _threadLock.Dispose();
-            _threadLock = null;
+            threadLock.Dispose();
+            threadLock = null;
         }
 
-        _read = false;
+        read = false;
     }
 
-    public void Read()
+    public async Task ReadAsync()
     {
-        var shouldWrite = AccessFile(() =>
+        await FileUtils.ReadFileAsync(path, async reader =>
         {
-            return !FileUtils.ReadBinary(_path, 4, reader =>
-            {
-                var tableCount = reader.ReadInt32();
-
-                if (tableCount < 1)
-                {
-                    if (_tables.Count > 0)
-                    {
-                        foreach (var table in _tables)
-                            table.Value.Dispose();
-
-                        _tables.Clear();
-                    }
-
-                    return;
-                }
-
-                for (int i = 0; i < tableCount; i++)
-                {
-                    var nameLen = reader.ReadInt32();
-                    var nameBytes = reader.ReadBytes(nameLen);
-                    var nameValue = Encoding.UTF32.GetString(nameBytes);
-
-                    if (_tables.TryGetValue(nameValue, out var table))
-                    {
-                        table.ReadSelf(reader, true);
-                    }
-                    else
-                    {
-                        table = new DatabaseTable(nameValue, this);
-                        table.ReadSelf(reader, false);
-
-                        _tables.TryAdd(nameValue, table);
-                    }
-                }
-
-                _read = true;
-            });
-        }, true);
-
-        _read = true;
-
-        if (shouldWrite)
-            Write();
-    }
-
-    public void Write()
-    {
-        AccessFile(() =>
-        {
-            FileUtils.CopyIfExists(_path, $"-backup-{DateTime.Now.ToLocalTime().Ticks}");
-            FileUtils.WriteBinary(_path, writer =>
-            {
-                writer.Write(_tables.Count);
-
-                foreach (var table in _tables)
-                {
-                    var nameBytes = Encoding.UTF32.GetBytes(table.Key);
-
-                    writer.Write(nameBytes.Length);
-                    writer.Write(nameBytes);
-
-                    table.Value.WriteSelf(writer);
-                }
-            });
+            await fileReaderWriter.ReadAsync(reader, this, deserializer, !read);
         });
+        
+        read = true;
+    }
+
+    public async Task WriteAsync()
+    {
+        await FileUtils.WriteFileAsync(path, async writer =>
+        {
+            await fileReaderWriter.WriteAsync(writer, this, serializer);
+        });
+    }
+
+    public DatabaseTable InstantiateTable(string tableName)
+    {
+        if (!IsInitialized) throw new Exception("The database file has not been initialized yet");
+        if (string.IsNullOrWhiteSpace(tableName)) throw new ArgumentNullException(nameof(tableName));
+        
+        return new DatabaseTable(tableName, this);
     }
 
     public DatabaseTable GetTable(string tableName)
     {
-        if (!IsInitialized)
-            throw new Exception("The database file has not been initialized yet");
+        if (!IsInitialized) throw new Exception("The database file has not been initialized yet");
+        if (!read) throw new Exception("The database file has not been loaded yet");
+        if (string.IsNullOrWhiteSpace(tableName)) throw new ArgumentNullException(nameof(tableName));
         
-        if (!_read)
-            throw new Exception("The database file has not been loaded yet");
-        
-        if (string.IsNullOrWhiteSpace(tableName))
-            throw new ArgumentNullException(nameof(tableName));
-        
-        if (_tables.TryGetValue(tableName, out var table))
-            return table;
+        if (tables.TryGetValue(tableName, out var table)) return table;
 
         table = new DatabaseTable(tableName, this);
 
-        _tables.TryAdd(tableName, table);
-
-        Monitor.Register(false);
+        tables.TryAdd(tableName, table);
         return table;
     }
 
     public bool DropTable(string tableName)
     {
-        if (!IsInitialized)
-            throw new Exception("The database file has not been initialized yet");
+        if (!IsInitialized) throw new Exception("The database file has not been initialized yet");
+        if (!read) throw new Exception("The database file has not been loaded yet");
+        if (string.IsNullOrWhiteSpace(tableName)) throw new ArgumentNullException(nameof(tableName));
         
-        if (!_read)
-            throw new Exception("The database file has not been loaded yet");
-
-        if (string.IsNullOrWhiteSpace(tableName))
-            throw new ArgumentNullException(nameof(tableName));
-        
-        if (!_tables.TryRemove(tableName, out var table))
-            return false;
+        if (!tables.TryRemove(tableName, out var table)) return false;
 
         table.Dispose();
 
-        Monitor.Register(false);
+        Monitor.Register();
         return true;
     }
 
-    private void AccessFile(Action action, bool ignoreRead = false)
+    private async Task AccessFile(Action action)
     {
-        if (!IsInitialized)
-            throw new Exception("The database file has not been initialized yet");
-        
-        if (!_read && !ignoreRead)
-            throw new Exception("The database file has not been loaded yet");
+        if (!IsInitialized) throw new Exception("The database file has not been initialized yet");
 
-        _threadLock.Trigger();
+        threadLock.Trigger();
 
-        _fileLock.WaitBlocking(MaxLockTime, LockWaitTime, LockIgnoreThisProcess, LockMatchCustomPrefix, LockKillOverTime, LockDeleteOverTime, LockAllowSelfProcessKill);
-        _fileLock.Trigger();
+        if (lockEnabled)
+        {
+            await fileLock.WaitAsync(MaxLockTime, LockWaitTime, LockIgnoreThisProcess, LockMatchCustomPrefix, LockKillOverTime, LockDeleteOverTime, LockAllowSelfProcessKill);
+            await fileLock.TriggerAsync();
+        }
 
         var e = default(Exception);
 
@@ -328,33 +447,31 @@ public class DatabaseFile : IDisposable
         }
         finally
         {
-            _fileLock.Release();
-            _threadLock.Release();
+            fileLock.Release();
+            threadLock.Release();
         }
 
-        if (e != null)
-            throw e;
+        if (e != null) throw e;
     }
 
-    private T AccessFile<T>(Func<T> action, bool ignoreRead = false)
+    private async Task<T> AccessFile<T>(Func<Task<T>> action)
     {
-        if (!IsInitialized)
-            throw new Exception("The database file has not been initialized yet");
-        
-        if (!_read && !ignoreRead)
-            throw new Exception("The database file has not been loaded yet");
+        if (!IsInitialized) throw new Exception("The database file has not been initialized yet");
 
-        _threadLock.Trigger();
+        threadLock.Trigger();
 
-        _fileLock.WaitBlocking(MaxLockTime, LockWaitTime, LockIgnoreThisProcess, LockMatchCustomPrefix, LockKillOverTime, LockDeleteOverTime, LockAllowSelfProcessKill);
-        _fileLock.Trigger();
+        if (lockEnabled)
+        {
+            await fileLock.WaitAsync(MaxLockTime, LockWaitTime, LockIgnoreThisProcess, LockMatchCustomPrefix, LockKillOverTime, LockDeleteOverTime, LockAllowSelfProcessKill);
+            await fileLock.TriggerAsync();
+        }
 
         var e = default(Exception);
         var result = default(T);
 
         try
         {
-            result = action();
+            result = await action();
         }
         catch (Exception ex)
         {
@@ -362,13 +479,11 @@ public class DatabaseFile : IDisposable
         }
         finally
         {
-            _fileLock.Release();
-            _threadLock.Release();
+            fileLock.Release();
+            threadLock.Release();
         }
 
-        if (e != null)
-            throw e;
-
+        if (e != null) throw e;
         return result;
     }
 }
