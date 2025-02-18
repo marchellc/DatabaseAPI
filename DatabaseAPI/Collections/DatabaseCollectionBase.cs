@@ -41,14 +41,13 @@ public abstract class DatabaseCollectionBase : IDisposable
     
     public int? GetObjectId(object obj) => Manipulator.GetObjectId(obj);
     
-    public virtual void Dispose() { }
 
     public void SaveChanges() => Monitor.Register();
+    
+    public abstract void Dispose();
+    public abstract void AddItems(IEnumerable<object> items);
 
     public abstract IEnumerator<object> EnumerateItems();
-
-    internal abstract void SetIndex(int index, object item);
-    internal abstract void RemoveIndex(int index);
 
     internal abstract void ClearArray();
 

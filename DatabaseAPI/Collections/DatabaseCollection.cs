@@ -5,6 +5,7 @@ using System.Collections.Concurrent;
 using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
+using DatabaseAPI.Extensions;
 using DatabaseAPI.IO.Interfaces;
 using DatabaseAPI.Logging;
 
@@ -22,7 +23,7 @@ public class DatabaseCollection<T> : DatabaseCollectionBase, IEnumerable<T> wher
         set => constructor = value;
     }
 
-    private volatile DatabaseCollectionItem<T>[] array;
+    private volatile T[] array;
     
     private volatile bool isDisposed = false;
     private volatile bool isReady = false;
@@ -44,7 +45,7 @@ public class DatabaseCollection<T> : DatabaseCollectionBase, IEnumerable<T> wher
         
         for (int i = 0; i < array.Length; i++)
         {
-            if (!array[i].TryGetValue(out var item)) continue;
+            if (!array.TryGet(i, out var item)) continue;
             if (!predicate(item)) continue;
             
             list.Add(item);
@@ -62,7 +63,7 @@ public class DatabaseCollection<T> : DatabaseCollectionBase, IEnumerable<T> wher
         
         for (int i = 0; i < array.Length; i++)
         {
-            if (!array[i].TryGetValue(out var heldItem)) continue;
+            if (!array.TryGet(i, out var heldItem)) continue;
             if (!predicate(heldItem)) continue;
 
             return heldItem;
@@ -75,14 +76,14 @@ public class DatabaseCollection<T> : DatabaseCollectionBase, IEnumerable<T> wher
     {
         if (!isReady) throw new Exception("Collection cannot be accessed while not ready");
         if (isDisposed) throw new ObjectDisposedException("Collection is disposed.");
-        
+
         if (predicate is null) throw new ArgumentNullException(nameof(predicate));
 
         isNew = false;
-        
+
         for (int i = 0; i < array.Length; i++)
         {
-            if (!array[i].TryGetValue(out var heldItem)) continue;
+            if (!array.TryGet(i, out var heldItem)) continue;
             if (!predicate(heldItem)) continue;
 
             return heldItem;
@@ -93,6 +94,13 @@ public class DatabaseCollection<T> : DatabaseCollectionBase, IEnumerable<T> wher
 
         isNew = true;
 
+        CheckArray(newId + 1);
+
+        array[GetNewIndex()] = newItem;
+
+        Manipulator.SetObjectId(newItem, newId);
+        Data.IncrementSize(1);
+
         try
         {
             newSetup?.Invoke(newItem);
@@ -101,21 +109,8 @@ public class DatabaseCollection<T> : DatabaseCollectionBase, IEnumerable<T> wher
         {
             Log.Error("Database Collection", ex);
         }
-        
-        CheckArray(newId + 1);
 
-        if (array[newId].HoldItem(newItem))
-        {
-            Manipulator.SetObjectId(newItem, newId);
-            Data.IncrementSize(1);
-            Monitor.Register();
-        }
-        else
-        {
-            Data.IdQueue.Enqueue(newId);
-        }
-        
-        
+        Monitor.Register();
         return newItem;
     }
 
@@ -138,7 +133,15 @@ public class DatabaseCollection<T> : DatabaseCollectionBase, IEnumerable<T> wher
         
         var newItem = Constructor();
         var newId = Data.NextObjectId;
+        
+        Manipulator.SetObjectId(newItem, newId);
 
+        CheckArray(array.Length + 1);
+        
+        array[GetNewIndex()] = newItem;
+        
+        Data.IncrementSize(1);
+        
         try
         {
             update(newItem, false);
@@ -146,19 +149,6 @@ public class DatabaseCollection<T> : DatabaseCollectionBase, IEnumerable<T> wher
         catch (Exception ex)
         {
             Log.Error("Database Collection", ex);
-        }
-        
-        CheckArray(newId + 1);
-
-        if (array[newId].HoldItem(newItem))
-        {
-            Manipulator.SetObjectId(newItem, newId);
-            Data.IncrementSize(1);
-        }
-        else
-        {
-            Data.IdQueue.Enqueue(newId);
-            return;
         }
         
         Monitor.Register();
@@ -191,12 +181,12 @@ public class DatabaseCollection<T> : DatabaseCollectionBase, IEnumerable<T> wher
                     if (batchStatus || batchStartIndex >= array.Length) 
                         break;
                     
-                    if (!array[batchStartIndex++].TryGetValue(out var heldItem)) continue;
+                    if (!array.TryGet(batchStartIndex++, out var heldItem)) continue;
                     if (!predicate(heldItem)) continue;
 
                     batchStatus = true;
                     
-                    onCompleted(heldItem, true);
+                    ThreadUtils.RunOnMain(() => onCompleted(heldItem, true));
                     break;
                 }
             }
@@ -217,11 +207,12 @@ public class DatabaseCollection<T> : DatabaseCollectionBase, IEnumerable<T> wher
     {
         if (!isReady) throw new Exception("Collection cannot be accessed while not ready");
         if (isDisposed) throw new ObjectDisposedException("Collection is disposed.");
+        
         if (predicate is null) throw new ArgumentNullException(nameof(predicate));
         
         for (int i = 0; i < array.Length; i++)
         {
-            if (!array[i].TryGetValue(out var heldItem)) continue;
+            if (!array.TryGet(i, out var heldItem)) continue;
             if (!predicate(heldItem)) continue;
             
             item = heldItem;
@@ -236,14 +227,26 @@ public class DatabaseCollection<T> : DatabaseCollectionBase, IEnumerable<T> wher
     {
         if (!isReady) throw new Exception("Collection cannot be accessed while not ready");
         if (isDisposed) throw new ObjectDisposedException("Collection is disposed.");
+        
         if (itemId < 0) throw new ArgumentException("ItemId cannot be negative.");
         
         item = null;
-        
-        if (itemId >= array.Length) 
-            return false;
 
-        return array[itemId].TryGetValue(out item);
+        for (int i = 0; i < array.Length; i++)
+        {
+            if (!array.TryGet(i, out var heldItem)) 
+                continue;
+
+            var heldId = Manipulator.GetObjectId(heldItem);
+            
+            if (!heldId.HasValue || heldId.Value != itemId) 
+                continue;
+            
+            item = heldItem;
+            return true;
+        }
+
+        return false;
     }
     
     public int TryRemoveWhere(Func<T, bool> predicate)
@@ -256,10 +259,13 @@ public class DatabaseCollection<T> : DatabaseCollectionBase, IEnumerable<T> wher
 
         for (int i = 0; i < array.Length; i++)
         {
-            if (!array[i].TryGetValue(out var heldItem)) continue;
+            if (!array.TryGet(i, out var heldItem)) continue;
             if (!predicate(heldItem)) continue;
-            if (!array[i].ReleaseItem()) continue;
-            if (Manipulator.RemoveObjectId(heldItem, out var id)) Data.IdQueue.Enqueue(id);
+
+            array[i] = null;
+            
+            if (Manipulator.RemoveObjectId(heldItem, out var id)) 
+                Data.IdQueue.Enqueue(id);
 
             removedCount++;
         }
@@ -284,14 +290,15 @@ public class DatabaseCollection<T> : DatabaseCollectionBase, IEnumerable<T> wher
         
         if (count < 1) return 0;
 
-        foreach (var item in items)
+        for (int i = 0; i < array.Length; i++)
         {
-            var currentItemId = Manipulator.GetObjectId(item);
+            if (!array.TryGet(i, out var item)) continue;
+            if (!items.Contains(item)) continue;
+
+            array[i] = null;
             
-            if (!currentItemId.HasValue) continue;
-            if (currentItemId.Value >= array.Length) continue;
-            if (!array[currentItemId.Value].ReleaseItem()) continue;
-            if (Manipulator.RemoveObjectId(item, out var id)) Data.IdQueue.Enqueue(id);
+            if (Manipulator.RemoveObjectId(item, out var id)) 
+                Data.IdQueue.Enqueue(id);
 
             removedCount++;
         }
@@ -309,21 +316,21 @@ public class DatabaseCollection<T> : DatabaseCollectionBase, IEnumerable<T> wher
     {
         if (!isReady) throw new Exception("Collection cannot be accessed while not ready");
         if (isDisposed) throw new ObjectDisposedException("Collection is disposed.");
+        
         if (item is null) throw new ArgumentNullException(nameof(item));
-        
-        var currentItemId = Manipulator.GetObjectId(item);
-        if (!currentItemId.HasValue) return false;
-        
-        CheckArray(currentItemId.Value + 1);
 
-        if (array[currentItemId.Value].ReleaseItem())
+        for (int i = 0; i < array.Length; i++)
         {
-            if (Manipulator.RemoveObjectId(item, out var id))
+            var indexItem = array[i];
+            
+            if (indexItem is null) continue;
+            if (!indexItem.Equals(item)) continue;
+
+            array[i] = null;
+            
+            if (Manipulator.RemoveObjectId(indexItem, out var id)) 
                 Data.IdQueue.Enqueue(id);
-            
-            Data.DecrementSize(1);
-            
-            Monitor.Register();
+
             return true;
         }
 
@@ -340,21 +347,22 @@ public class DatabaseCollection<T> : DatabaseCollectionBase, IEnumerable<T> wher
         var addedCount = 0;
         
         if (count < 1) return 0;
+
+        var indexes = GetIndexes(count);
+        var index = 0;
         
-        CheckArray(count);
+        CheckArray(array.Length + count);
 
         foreach (var item in items)
         {
-            var currentItemId = Manipulator.GetObjectId(item);
-            if (currentItemId.HasValue) continue;
-
-            var newItemId = Data.NextObjectId;
+            Manipulator.SetObjectId(item, Data.NextObjectId);
             
-            CheckArray(newItemId + 1);
-
-            if (array[newItemId].HoldItem(item))
-                addedCount++;
+            array[indexes[index++]] = item;
+            
+            addedCount++;
         }
+        
+        PoolUtils<int>.Return(indexes);
 
         if (addedCount > 0)
         {
@@ -370,25 +378,17 @@ public class DatabaseCollection<T> : DatabaseCollectionBase, IEnumerable<T> wher
         if (!isReady) throw new Exception("Collection cannot be accessed while not ready");
         if (isDisposed) throw new ObjectDisposedException("Collection is disposed.");
         if (item is null) throw new ArgumentNullException(nameof(item));
-
-        var currentItemId = Manipulator.GetObjectId(item);
-        if (currentItemId.HasValue) return false;
-
-        var newItemId = Data.NextObjectId;
-
-        Manipulator.SetObjectId(item, newItemId);
-
-        CheckArray(newItemId + 1);
-
-        if (array[newItemId].HoldItem(item))
-        {
-            Data.IncrementSize(1);
-            
-            Monitor.Register();
-            return true;
-        }
-
-        return false;
+        
+        Manipulator.SetObjectId(item, Data.NextObjectId);
+        
+        CheckArray(array.Length + 1);
+        
+        array[GetNewIndex()] = item;
+        
+        Data.IncrementSize(1);
+        
+        Monitor.Register();
+        return true;
     }
 
     #region IEnumerable implementation
@@ -402,11 +402,9 @@ public class DatabaseCollection<T> : DatabaseCollectionBase, IEnumerable<T> wher
         for (int i = 0; i < array.Length; i++)
         {
             var item = array[i];
+            if (item is null) continue;
 
-            if (!item.TryGetValue(out var value)) 
-                continue;
-
-            yield return value;
+            yield return item;
         }
     }
     
@@ -419,7 +417,7 @@ public class DatabaseCollection<T> : DatabaseCollectionBase, IEnumerable<T> wher
 
         for (int i = 0; i < array.Length; i++)
         {
-            if (!array[i].TryGetValue(out var item)) continue;
+            if (!array.TryGet(i, out var item)) continue;
             if (!predicate(item)) continue;
             
             yield return item;
@@ -433,7 +431,7 @@ public class DatabaseCollection<T> : DatabaseCollectionBase, IEnumerable<T> wher
         
         for (int i = 0; i < array.Length; i++)
         {
-            if (!array[i].TryGetValue(out var item))
+            if (!array.TryGet(i, out var item))
                 continue;
             
             yield return item;
@@ -444,7 +442,7 @@ public class DatabaseCollection<T> : DatabaseCollectionBase, IEnumerable<T> wher
     private void CheckArray(int count)
     {
         if (array is null) InitializeArray(count < 1 ? null : count);
-        if (array.Length < count) ResizeArray(count < 1 ? null : count);
+        if (array.Length < count) ResizeArray(array.Length + count);
     }
 
     private void InitializeArray(int? requiredSize)
@@ -455,11 +453,11 @@ public class DatabaseCollection<T> : DatabaseCollectionBase, IEnumerable<T> wher
             
             if (requiredSize.HasValue && requiredSize.Value > size)
                 size += requiredSize.Value;
-            
-            array = new DatabaseCollectionItem<T>[size];
-            
+
+            array = new T[size];
+
             for (int i = 0; i < File.ArrayInitialSize; i++)
-                array[i] = new DatabaseCollectionItem<T>();
+                array[i] = null;
         }
     }
     
@@ -469,10 +467,10 @@ public class DatabaseCollection<T> : DatabaseCollectionBase, IEnumerable<T> wher
             
         if (requiredSize.HasValue && requiredSize.Value > size)
             size += requiredSize.Value;
-        
-        var newArray = new DatabaseCollectionItem<T>[size];
-        var oldArray = array;
 
+        var newArray = new T[size];
+        var oldArray = array;
+        
         array = newArray;
 
         for (int i = 0; i < size; i++)
@@ -484,9 +482,88 @@ public class DatabaseCollection<T> : DatabaseCollectionBase, IEnumerable<T> wher
             }
             else
             {
-                newArray[i] = new DatabaseCollectionItem<T>();
+                newArray[i] = null;
             }
         }
+    }
+
+    private int GetNewIndex()
+    {
+        for (int i = 0; i < array.Length; i++)
+        {
+            if (array[i] is null)
+                return i;
+        }
+
+        return -1;
+    }
+
+    public List<int> GetIndexes(int count)
+    {
+        var list = PoolUtils<int>.List;
+        if (list.Capacity < count) list.Capacity = count;
+        
+        for (int i = 0; i < count; i++)
+            list.Add(GetNewIndex());
+
+        return list;
+    }
+
+    public int SetNewIndex(T item)
+    {
+        var index = GetNewIndex();
+
+        if (index < 0)
+            throw new Exception("No more free space in array");
+        
+        array[index] = item;
+        return index;
+    }
+
+    public override void AddItems(IEnumerable<object> items)
+    {
+        if (!isReady) throw new Exception("Collection cannot be accessed while not ready");
+        if (isDisposed) throw new ObjectDisposedException("Collection is disposed.");
+        if (items is null) throw new ArgumentNullException(nameof(items));
+
+        var count = items.Count();
+        var addedCount = 0;
+
+        if (count < 1) return;
+
+        var indexes = GetIndexes(count);
+        var index = 0;
+        
+        CheckArray(array.Length + count);
+
+        foreach (var item in items)
+        {
+            Manipulator.SetObjectId(item, Data.NextObjectId);
+            
+            array[indexes[index++]] = (T)item;
+            
+            addedCount++;
+        }
+        
+        PoolUtils<int>.Return(indexes);
+
+        if (addedCount > 0)
+        {
+            Data.IncrementSize(addedCount);
+            Monitor.Register();
+        }
+    }
+
+    public override void Dispose()
+    {
+        if (isDisposed) throw new ObjectDisposedException("Collection is disposed.");
+
+        isReady = false;
+        isDisposed = true;
+        
+        ClearArray();
+        
+        array = null;
     }
 
     internal override void ClearArray()
@@ -495,30 +572,9 @@ public class DatabaseCollection<T> : DatabaseCollectionBase, IEnumerable<T> wher
         
         if (array is null) 
             return;
-        
+
         for (int i = 0; i < array.Length; i++)
-            array[i].ReleaseItem();
-    }
-    
-    internal override void SetIndex(int index, object item)
-    {
-        if (isReady) throw new Exception("Collection is in ready mode.");
-        if (isDisposed) throw new ObjectDisposedException("Collection is disposed.");
-        
-        CheckArray(index + 1);
-
-        array[index].HoldItem((T)item);
-    }
-
-    internal override void RemoveIndex(int index)
-    {
-        if (isReady) throw new Exception("Collection is in ready mode.");
-        if (isDisposed) throw new ObjectDisposedException("Collection is disposed.");
-        
-        CheckArray(index + 1);
-        
-        if (array[index].ReleaseItem())
-            Data.DecrementSize(1);
+            array[i] = null;
     }
     
     internal override bool TryGetItem(int itemId, out object item)
@@ -528,11 +584,21 @@ public class DatabaseCollection<T> : DatabaseCollectionBase, IEnumerable<T> wher
 
         item = null;
         
-        if (itemId < 0 || itemId >= array.Length || !array[itemId].TryGetValue(out var heldItem)) 
-            return false;
+        if (itemId < 0) return false;
 
-        item = heldItem;
-        return true;
+        for (int i = 0; i < array.Length; i++)
+        {
+            if (!array.TryGet(i, out var heldItem)) continue;
+            
+            var heldId = Manipulator.GetObjectId(heldItem);
+            
+            if (!heldId.HasValue || heldId.Value != itemId) continue;
+            
+            item = heldItem;
+            return true;
+        }
+
+        return false;
     }
 
     internal override void RemoveMissing(List<int> foundIds)
@@ -542,16 +608,16 @@ public class DatabaseCollection<T> : DatabaseCollectionBase, IEnumerable<T> wher
         
         for (int i = 0; i < array.Length; i++)
         {
-            if (!array[i].TryGetValue(out var item)) continue;
+            if (!array.TryGet(i, out var item)) continue;
             
             var id = Manipulator.GetObjectId(item);
             
             if (!id.HasValue) continue;
-            if (!foundIds.Contains(id.Value)) continue;
+            if (foundIds.Contains(id.Value)) continue;
             
             Manipulator.RemoveObjectId(item, out _);
-            
-            array[i].ReleaseItem();
+
+            array[i] = null;
         }
     }
 

@@ -25,6 +25,10 @@ public class SimpleCollectionReaderWriter : ICollectionReaderWriter
         {
             while (enumerator.MoveNext())
             {
+                var itemId = data.Manipulator.GetObjectId(enumerator.Current);
+                if (!itemId.HasValue) continue;
+
+                await serializer.WriteIntAsync(writer, itemId.Value);
                 await data.ReaderWriter.SerializeAsync(writer, enumerator.Current, data, serializer);
             }
         }
@@ -35,7 +39,9 @@ public class SimpleCollectionReaderWriter : ICollectionReaderWriter
         var size = await deserializer.ReadIntAsync(reader);
         var id = await deserializer.ReadIntAsync(reader);
         var queueSize = await deserializer.ReadIntAsync(reader);
+        
         var foundList = PoolUtils<int>.List;
+        var objectList = PoolUtils<object>.List;
 
         data.Size = size;
         data.IdClock = id;
@@ -65,18 +71,22 @@ public class SimpleCollectionReaderWriter : ICollectionReaderWriter
             {
                 if (Activator.CreateInstance(data.Type) is not object instance)
                     throw new Exception($"Could not instantiate type {data.Type.FullName}");
+
+                data.Manipulator.SetObjectId(instance, objectId);
                 
                 await data.ReaderWriter.DeserializeAsync(reader, instance, data, deserializer);
-
-                data.Wrapper.SetIndex(objectId, instance);
+                
+                objectList.Add(instance);
             }
         }
         
         if (!isInitialRead)
             data.Wrapper.RemoveMissing(foundList);
         
+        data.Wrapper.AddItems(objectList);
         data.SetReady();
         
         PoolUtils<int>.Return(foundList);
+        PoolUtils<object>.Return(objectList);
     }
 }
